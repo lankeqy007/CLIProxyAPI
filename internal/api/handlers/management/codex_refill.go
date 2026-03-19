@@ -346,16 +346,10 @@ func (h *Handler) codexAutoRefillClaimAndImport(ctx context.Context, manager *co
 		}
 		imported++
 		if runtimeCfg.VerifyAfterImport && auth != nil {
-			verifyCtx, cancel := context.WithTimeout(context.Background(), runtimeCfg.Timeout)
-			status, errProbe := h.probeCodexAuth(verifyCtx, manager, auth)
-			cancel()
-			if shouldDeleteCodexAuthStatus(status) {
+			if decision, shouldDelete := codexSweepDeleteDecision(auth, time.Now()); shouldDelete {
 				_ = h.deleteCodexAuthFile(context.Background(), auth, h.codexSweepTargetPath(auth))
+				log.Warnf("management codex auto-refill: dropped imported auth=%s status=%d reason=%s", strings.TrimSpace(auth.ID), decision.status, decision.reason)
 				imported--
-				continue
-			}
-			if errProbe != nil && status == 0 {
-				log.WithError(errProbe).Debugf("management codex auto-refill: keeping imported auth %s due to non-http verify error", strings.TrimSpace(auth.ID))
 			}
 		}
 	}

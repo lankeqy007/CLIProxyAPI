@@ -11,24 +11,17 @@ import (
 	"time"
 
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
-	sdktranslator "github.com/router-for-me/CLIProxyAPI/v6/sdk/translator"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
 	codexSweepEnabledEnv      = "CPA_CODEX_SWEEP_ENABLED"
 	codexSweepIntervalEnv     = "CPA_CODEX_SWEEP_INTERVAL"
-	codexSweepTimeoutEnv      = "CPA_CODEX_SWEEP_TIMEOUT"
 	codexSweepInitialDelayEnv = "CPA_CODEX_SWEEP_INITIAL_DELAY"
 
 	codexSweepDefaultInterval     = 15 * time.Minute
-	codexSweepDefaultTimeout      = 20 * time.Second
 	codexSweepDefaultInitialDelay = 2 * time.Minute
-	codexSweepProbeModel          = "gpt-5"
 )
-
-var codexSweepProbePayload = []byte(`{"model":"gpt-5","input":[{"role":"user","content":"ping"}]}`)
 
 func (h *Handler) startCodexCredentialSweep() {
 	if h == nil || !codexSweepEnabled() {
@@ -36,9 +29,8 @@ func (h *Handler) startCodexCredentialSweep() {
 	}
 
 	interval := codexSweepDurationFromEnv(codexSweepIntervalEnv, codexSweepDefaultInterval)
-	timeout := codexSweepDurationFromEnv(codexSweepTimeoutEnv, codexSweepDefaultTimeout)
 	initialDelay := codexSweepDurationFromEnv(codexSweepInitialDelayEnv, codexSweepDefaultInitialDelay)
-	if interval <= 0 || timeout <= 0 {
+	if interval <= 0 {
 		return
 	}
 
@@ -49,12 +41,12 @@ func (h *Handler) startCodexCredentialSweep() {
 			<-timer.C
 		}
 
-		h.runCodexCredentialSweep(timeout)
+		h.runCodexCredentialSweep()
 
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for range ticker.C {
-			h.runCodexCredentialSweep(timeout)
+			h.runCodexCredentialSweep()
 		}
 	}()
 }
@@ -92,37 +84,33 @@ func codexSweepDurationFromEnv(name string, fallback time.Duration) time.Duratio
 	return parsed
 }
 
-func (h *Handler) runCodexCredentialSweep(timeout time.Duration) {
+type codexSweepDecision struct {
+	status int
+	reason string
+}
+
+func (h *Handler) runCodexCredentialSweep() {
 	manager := h.currentAuthManager()
 	if manager == nil {
 		return
 	}
-	if _, ok := manager.Executor("codex"); !ok {
-		return
-	}
-
+	now := time.Now()
 	for _, auth := range manager.List() {
 		path := h.codexSweepTargetPath(auth)
 		if path == "" {
 			continue
 		}
 
-		probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
-		status, err := h.probeCodexAuth(probeCtx, manager, auth)
-		cancel()
-
-		if !shouldDeleteCodexAuthStatus(status) {
-			if err != nil && status == 0 {
-				log.WithError(err).Debugf("management codex sweep: keeping auth %s due to non-http probe error", strings.TrimSpace(auth.ID))
-			}
+		decision, shouldDelete := codexSweepDeleteDecision(auth, now)
+		if !shouldDelete {
 			continue
 		}
 
 		if errDelete := h.deleteCodexAuthFile(context.Background(), auth, path); errDelete != nil {
-			log.WithError(errDelete).Warnf("management codex sweep: failed to remove auth=%s status=%d file=%s", strings.TrimSpace(auth.ID), status, path)
+			log.WithError(errDelete).Warnf("management codex sweep: failed to remove auth=%s status=%d reason=%s file=%s", strings.TrimSpace(auth.ID), decision.status, decision.reason, path)
 			continue
 		}
-		log.Warnf("management codex sweep: removed auth=%s status=%d file=%s", strings.TrimSpace(auth.ID), status, path)
+		log.Warnf("management codex sweep: removed auth=%s status=%d reason=%s file=%s", strings.TrimSpace(auth.ID), decision.status, decision.reason, path)
 	}
 }
 
@@ -175,6 +163,26 @@ func (h *Handler) codexSweepTargetPath(auth *coreauth.Auth) string {
 	return absolutePath(filepath.Join(authDir, filepath.Base(fileName)))
 }
 
+func codexSweepDeleteDecision(auth *coreauth.Auth, now time.Time) (codexSweepDecision, bool) {
+	if auth == nil {
+		return codexSweepDecision{}, false
+	}
+	if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+		return codexSweepDecision{}, false
+	}
+	if !auth.Unavailable || auth.LastError == nil {
+		return codexSweepDecision{}, false
+	}
+	if !shouldDeleteCodexAuthRuntimeError(auth.LastError) {
+		return codexSweepDecision{}, false
+	}
+	status := auth.LastError.StatusCode()
+	return codexSweepDecision{
+		status: status,
+		reason: codexSweepErrorReason(auth.LastError),
+	}, true
+}
+
 func absolutePath(path string) string {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -189,46 +197,60 @@ func absolutePath(path string) string {
 	return path
 }
 
-func (h *Handler) probeCodexAuth(ctx context.Context, manager *coreauth.Manager, auth *coreauth.Auth) (int, error) {
-	if manager == nil || auth == nil {
-		return 0, nil
-	}
-	executor, ok := manager.Executor("codex")
-	if !ok || executor == nil {
-		return 0, nil
-	}
-
-	_, err := executor.Execute(ctx, auth, cliproxyexecutor.Request{
-		Model:   codexSweepProbeModel,
-		Payload: append([]byte(nil), codexSweepProbePayload...),
-		Format:  sdktranslator.FromString("openai-response"),
-	}, cliproxyexecutor.Options{
-		Alt:          "responses/compact",
-		SourceFormat: sdktranslator.FromString("openai-response"),
-	})
+func shouldDeleteCodexAuthRuntimeError(err *coreauth.Error) bool {
 	if err == nil {
-		return http.StatusOK, nil
+		return false
 	}
-	if statusProvider, ok := err.(interface{ StatusCode() int }); ok {
-		return statusProvider.StatusCode(), err
+	switch err.StatusCode() {
+	case http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden:
+		return true
+	case http.StatusBadRequest:
+		return codexAuthErrorLooksInvalid(err)
+	default:
+		return false
 	}
-	return 0, err
 }
 
-func shouldDeleteCodexAuthStatus(status int) bool {
-	if status <= 0 {
+func codexAuthErrorLooksInvalid(err *coreauth.Error) bool {
+	if err == nil {
 		return false
 	}
-	if status >= http.StatusOK && status < http.StatusMultipleChoices {
+	raw := strings.ToLower(strings.TrimSpace(strings.Join([]string{err.Code, err.Message}, " ")))
+	if raw == "" {
 		return false
 	}
-	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
+	if strings.Contains(raw, "invalid_request_error") || strings.Contains(raw, "unsupported_parameter") {
 		return false
 	}
-	if status >= http.StatusInternalServerError && status < 600 {
-		return false
+	for _, needle := range []string{
+		"invalid_grant",
+		"invalid_token",
+		"expired_token",
+		"token expired",
+		"invalid refresh",
+		"refresh token",
+		"session expired",
+		"account deactivated",
+	} {
+		if strings.Contains(raw, needle) {
+			return true
+		}
 	}
-	return true
+	return false
+}
+
+func codexSweepErrorReason(err *coreauth.Error) string {
+	if err == nil {
+		return ""
+	}
+	message := strings.TrimSpace(err.Message)
+	if message == "" {
+		message = strings.TrimSpace(err.Code)
+	}
+	if message == "" {
+		return "runtime error"
+	}
+	return message
 }
 
 func (h *Handler) deleteCodexAuthFile(ctx context.Context, auth *coreauth.Auth, path string) error {

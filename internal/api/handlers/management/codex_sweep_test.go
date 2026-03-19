@@ -2,7 +2,6 @@ package management
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -11,63 +10,75 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 )
 
-func TestShouldDeleteCodexAuthStatus(t *testing.T) {
+func TestShouldDeleteCodexAuthRuntimeError(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
-		status int
-		want   bool
+		err  *coreauth.Error
+		want bool
 	}{
-		{status: 0, want: false},
-		{status: http.StatusOK, want: false},
-		{status: http.StatusNoContent, want: false},
-		{status: http.StatusBadRequest, want: true},
-		{status: http.StatusUnauthorized, want: true},
-		{status: http.StatusPaymentRequired, want: true},
-		{status: http.StatusForbidden, want: true},
-		{status: http.StatusNotFound, want: true},
-		{status: http.StatusRequestTimeout, want: false},
-		{status: http.StatusTooManyRequests, want: false},
-		{status: http.StatusBadGateway, want: false},
+		{err: nil, want: false},
+		{err: &coreauth.Error{HTTPStatus: http.StatusUnauthorized}, want: true},
+		{err: &coreauth.Error{HTTPStatus: http.StatusPaymentRequired}, want: true},
+		{err: &coreauth.Error{HTTPStatus: http.StatusForbidden}, want: true},
+		{err: &coreauth.Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error"}, want: false},
+		{err: &coreauth.Error{HTTPStatus: http.StatusBadRequest, Message: "oauth: invalid_grant"}, want: true},
+		{err: &coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}, want: false},
+		{err: &coreauth.Error{HTTPStatus: http.StatusBadGateway, Message: "upstream"}, want: false},
 	}
 
 	for _, tc := range cases {
-		if got := shouldDeleteCodexAuthStatus(tc.status); got != tc.want {
-			t.Fatalf("shouldDeleteCodexAuthStatus(%d) = %v, want %v", tc.status, got, tc.want)
+		if got := shouldDeleteCodexAuthRuntimeError(tc.err); got != tc.want {
+			t.Fatalf("shouldDeleteCodexAuthRuntimeError(%#v) = %v, want %v", tc.err, got, tc.want)
 		}
 	}
 }
 
-func TestRunCodexCredentialSweep_RemovesOnlyInvalidFileBackedAuths(t *testing.T) {
+func TestRunCodexCredentialSweep_RemovesOnlyUnavailableFatalFileBackedAuths(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	t.Setenv(codexSweepEnabledEnv, "false")
 
 	authDir := t.TempDir()
 	removePath := filepath.Join(authDir, "remove.json")
 	keepQuotaPath := filepath.Join(authDir, "keep-quota.json")
-	keepNetworkPath := filepath.Join(authDir, "keep-network.json")
-	for _, item := range []string{removePath, keepQuotaPath, keepNetworkPath} {
+	keepTransientPath := filepath.Join(authDir, "keep-transient.json")
+	keepRequestPath := filepath.Join(authDir, "keep-request.json")
+	keepPartialPath := filepath.Join(authDir, "keep-partial.json")
+	for _, item := range []string{removePath, keepQuotaPath, keepTransientPath, keepRequestPath, keepPartialPath} {
 		if err := os.WriteFile(item, []byte(`{"type":"codex"}`), 0o600); err != nil {
 			t.Fatalf("failed to write auth file %s: %v", item, err)
 		}
 	}
 
 	manager := coreauth.NewManager(nil, nil, nil)
-	manager.RegisterExecutor(&codexSweepTestExecutor{
-		results: map[string]error{
-			"codex-remove":     &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
-			"codex-keep-quota": &coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
-			"codex-keep-net":   errors.New("dial tcp timeout"),
-		},
-	})
-
+	now := time.Now()
 	for _, auth := range []*coreauth.Auth{
-		newCodexSweepTestAuth("codex-remove", removePath),
-		newCodexSweepTestAuth("codex-keep-quota", keepQuotaPath),
-		newCodexSweepTestAuth("codex-keep-net", keepNetworkPath),
+		newCodexSweepTestAuth("codex-remove", removePath, func(a *coreauth.Auth) {
+			a.Unavailable = true
+			a.LastError = &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}
+			a.NextRetryAfter = now.Add(30 * time.Minute)
+		}),
+		newCodexSweepTestAuth("codex-keep-quota", keepQuotaPath, func(a *coreauth.Auth) {
+			a.Unavailable = true
+			a.LastError = &coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"}
+			a.NextRetryAfter = now.Add(5 * time.Minute)
+			a.Quota = coreauth.QuotaState{Exceeded: true, Reason: "quota", NextRecoverAt: now.Add(5 * time.Minute)}
+		}),
+		newCodexSweepTestAuth("codex-keep-transient", keepTransientPath, func(a *coreauth.Auth) {
+			a.Unavailable = true
+			a.LastError = &coreauth.Error{HTTPStatus: http.StatusBadGateway, Message: "upstream"}
+			a.NextRetryAfter = now.Add(1 * time.Minute)
+		}),
+		newCodexSweepTestAuth("codex-keep-request", keepRequestPath, func(a *coreauth.Auth) {
+			a.Unavailable = true
+			a.LastError = &coreauth.Error{HTTPStatus: http.StatusBadRequest, Message: "invalid_request_error"}
+		}),
+		newCodexSweepTestAuth("codex-keep-partial", keepPartialPath, func(a *coreauth.Auth) {
+			a.Unavailable = false
+			a.LastError = &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"}
+		}),
 		{
 			ID:       "codex-config",
 			Provider: "codex",
@@ -84,15 +95,17 @@ func TestRunCodexCredentialSweep_RemovesOnlyInvalidFileBackedAuths(t *testing.T)
 
 	store := &memoryAuthStore{
 		items: map[string]*coreauth.Auth{
-			removePath:      &coreauth.Auth{ID: removePath},
-			keepQuotaPath:   &coreauth.Auth{ID: keepQuotaPath},
-			keepNetworkPath: &coreauth.Auth{ID: keepNetworkPath},
+			removePath:        {ID: removePath},
+			keepQuotaPath:     {ID: keepQuotaPath},
+			keepTransientPath: {ID: keepTransientPath},
+			keepRequestPath:   {ID: keepRequestPath},
+			keepPartialPath:   {ID: keepPartialPath},
 		},
 	}
 
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
 	h.tokenStore = store
-	h.runCodexCredentialSweep(time.Second)
+	h.runCodexCredentialSweep()
 
 	if _, err := os.Stat(removePath); !os.IsNotExist(err) {
 		t.Fatalf("expected invalid auth file to be removed, stat err: %v", err)
@@ -107,22 +120,34 @@ func TestRunCodexCredentialSweep_RemovesOnlyInvalidFileBackedAuths(t *testing.T)
 	if _, err := os.Stat(keepQuotaPath); err != nil {
 		t.Fatalf("expected 429 auth file to remain, stat err: %v", err)
 	}
-	if _, err := os.Stat(keepNetworkPath); err != nil {
-		t.Fatalf("expected network-error auth file to remain, stat err: %v", err)
+	if _, err := os.Stat(keepTransientPath); err != nil {
+		t.Fatalf("expected transient auth file to remain, stat err: %v", err)
+	}
+	if _, err := os.Stat(keepRequestPath); err != nil {
+		t.Fatalf("expected request-error auth file to remain, stat err: %v", err)
+	}
+	if _, err := os.Stat(keepPartialPath); err != nil {
+		t.Fatalf("expected partially available auth file to remain, stat err: %v", err)
 	}
 	if auth, ok := manager.GetByID("codex-keep-quota"); !ok || auth.Disabled {
 		t.Fatalf("expected 429 auth to remain enabled, got %#v", auth)
 	}
-	if auth, ok := manager.GetByID("codex-keep-net"); !ok || auth.Disabled {
-		t.Fatalf("expected network-error auth to remain enabled, got %#v", auth)
+	if auth, ok := manager.GetByID("codex-keep-transient"); !ok || auth.Disabled {
+		t.Fatalf("expected transient auth to remain enabled, got %#v", auth)
+	}
+	if auth, ok := manager.GetByID("codex-keep-request"); !ok || auth.Disabled {
+		t.Fatalf("expected request-error auth to remain enabled, got %#v", auth)
+	}
+	if auth, ok := manager.GetByID("codex-keep-partial"); !ok || auth.Disabled {
+		t.Fatalf("expected partially available auth to remain enabled, got %#v", auth)
 	}
 	if auth, ok := manager.GetByID("codex-config"); !ok || auth.Disabled {
 		t.Fatalf("expected config-backed auth to be skipped, got %#v", auth)
 	}
 }
 
-func newCodexSweepTestAuth(id string, path string) *coreauth.Auth {
-	return &coreauth.Auth{
+func newCodexSweepTestAuth(id string, path string, mutate func(*coreauth.Auth)) *coreauth.Auth {
+	auth := &coreauth.Auth{
 		ID:       id,
 		Provider: "codex",
 		FileName: filepath.Base(path),
@@ -132,36 +157,8 @@ func newCodexSweepTestAuth(id string, path string) *coreauth.Auth {
 			"source": path,
 		},
 	}
-}
-
-type codexSweepTestExecutor struct {
-	results map[string]error
-}
-
-func (e *codexSweepTestExecutor) Identifier() string { return "codex" }
-
-func (e *codexSweepTestExecutor) Execute(_ context.Context, auth *coreauth.Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	if e == nil || auth == nil {
-		return cliproxyexecutor.Response{}, nil
+	if mutate != nil {
+		mutate(auth)
 	}
-	if err := e.results[auth.ID]; err != nil {
-		return cliproxyexecutor.Response{}, err
-	}
-	return cliproxyexecutor.Response{Payload: []byte(`{"ok":true}`)}, nil
-}
-
-func (e *codexSweepTestExecutor) ExecuteStream(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (e *codexSweepTestExecutor) Refresh(context.Context, *coreauth.Auth) (*coreauth.Auth, error) {
-	return nil, errors.New("not implemented")
-}
-
-func (e *codexSweepTestExecutor) CountTokens(context.Context, *coreauth.Auth, cliproxyexecutor.Request, cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
-	return cliproxyexecutor.Response{}, errors.New("not implemented")
-}
-
-func (e *codexSweepTestExecutor) HttpRequest(context.Context, *coreauth.Auth, *http.Request) (*http.Response, error) {
-	return nil, errors.New("not implemented")
+	return auth
 }
