@@ -5,10 +5,7 @@ RUN adduser -D -u 1000 app
 
 WORKDIR /app
 
-COPY server /app/server
-COPY entrypoint.sh /app/entrypoint.sh
-COPY config.template.yaml /app/config.template.yaml
-COPY config.example.yaml /app/config.example.yaml
+COPY . /app
 
 ENV HOME=/tmp
 ENV TZ=Asia/Shanghai
