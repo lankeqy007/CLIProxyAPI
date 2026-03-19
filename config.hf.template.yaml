@@ -8,6 +8,7 @@ remote-management:
   allow-remote: false
   secret-key: ""
   disable-control-panel: false
+  panel-github-repository: "https://github.com/lankeqy007/Cli-Proxy-API-Management-Center"
 
 auth-dir: "__AUTH_DIR__"
 
