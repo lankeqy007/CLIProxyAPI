@@ -393,6 +393,38 @@ func (c *Client) PutStringField(path string, value string) error {
 	return err
 }
 
+// GetCodexAutoRefill fetches the quota-exceeded codex auto-refill config object.
+func (c *Client) GetCodexAutoRefill() (map[string]any, error) {
+	wrapper, err := c.getJSON("/v0/management/quota-exceeded/codex-auto-refill")
+	if err != nil {
+		return nil, err
+	}
+	if raw, ok := wrapper["codex-auto-refill"].(map[string]any); ok {
+		return raw, nil
+	}
+	return map[string]any{}, nil
+}
+
+// PutCodexAutoRefill updates the full quota-exceeded codex auto-refill config object.
+func (c *Client) PutCodexAutoRefill(value map[string]any) error {
+	body, _ := json.Marshal(value)
+	_, err := c.put("/v0/management/quota-exceeded/codex-auto-refill", strings.NewReader(string(body)))
+	return err
+}
+
+// PutCodexAutoRefillField fetches the current object, updates one field, and writes it back.
+func (c *Client) PutCodexAutoRefillField(field string, value any) error {
+	cfg, err := c.GetCodexAutoRefill()
+	if err != nil {
+		return err
+	}
+	if cfg == nil {
+		cfg = make(map[string]any)
+	}
+	cfg[field] = value
+	return c.PutCodexAutoRefill(cfg)
+}
+
 // DeleteField sends a DELETE request for a config field.
 func (c *Client) DeleteField(path string) error {
 	_, _, err := c.doRequest("DELETE", "/v0/management/"+path, nil)

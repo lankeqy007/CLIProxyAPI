@@ -22,3 +22,23 @@ pprof:
 commercial-mode: false
 logging-to-file: false
 usage-statistics-enabled: false
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: true
+  codex-auto-refill:
+    enable: false
+    provider-url: "https://gptfreetoken.pony.indevs.in"
+    auth-mode: "api-key"
+    api-key-env: "TOKEN_ATLAS_API_KEY"
+    session-env: "TOKEN_ATLAS_SESSION"
+    check-interval-seconds: 120
+    min-claim-interval-seconds: 900
+    timeout-seconds: 20
+    low-watermark: 1
+    target-ready: 3
+    max-claim-per-run: 2
+    require-consecutive-low: 2
+    verify-after-import: true
+    priority: -10
+    note: "auto-refill"

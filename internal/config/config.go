@@ -184,6 +184,57 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
+
+	// CodexAutoRefill configures automatic replenishment of file-backed Codex credentials.
+	CodexAutoRefill CodexAutoRefill `yaml:"codex-auto-refill,omitempty" json:"codex-auto-refill,omitempty"`
+}
+
+// CodexAutoRefill configures background claim/download/import of file-backed Codex auths
+// when the ready credential pool falls below the desired watermark.
+type CodexAutoRefill struct {
+	Enable bool `yaml:"enable,omitempty" json:"enable,omitempty"`
+
+	// ProviderURL points at the external claim/download service base URL.
+	ProviderURL string `yaml:"provider-url,omitempty" json:"provider-url,omitempty"`
+
+	// AuthMode selects how the external service is authenticated: "api-key" or "session".
+	AuthMode string `yaml:"auth-mode,omitempty" json:"auth-mode,omitempty"`
+
+	// APIKeyEnv names the environment variable that contains the external API key.
+	APIKeyEnv string `yaml:"api-key-env,omitempty" json:"api-key-env,omitempty"`
+
+	// SessionEnv names the environment variable that contains token_atlas_session for cookie auth.
+	SessionEnv string `yaml:"session-env,omitempty" json:"session-env,omitempty"`
+
+	// CheckIntervalSeconds controls how often the background refill worker evaluates the pool.
+	CheckIntervalSeconds int `yaml:"check-interval-seconds,omitempty" json:"check-interval-seconds,omitempty"`
+
+	// MinClaimIntervalSeconds enforces a minimum delay between successful claim runs.
+	MinClaimIntervalSeconds int `yaml:"min-claim-interval-seconds,omitempty" json:"min-claim-interval-seconds,omitempty"`
+
+	// TimeoutSeconds controls the outbound HTTP timeout used for claim/download calls and optional verification.
+	TimeoutSeconds int `yaml:"timeout-seconds,omitempty" json:"timeout-seconds,omitempty"`
+
+	// LowWatermark is the minimum number of ready file-backed Codex auths to keep available.
+	LowWatermark int `yaml:"low-watermark,omitempty" json:"low-watermark,omitempty"`
+
+	// TargetReady is the desired ready credential count after a refill run.
+	TargetReady int `yaml:"target-ready,omitempty" json:"target-ready,omitempty"`
+
+	// MaxClaimPerRun limits how many credentials may be claimed in a single refill run.
+	MaxClaimPerRun int `yaml:"max-claim-per-run,omitempty" json:"max-claim-per-run,omitempty"`
+
+	// RequireConsecutiveLow requires the pool to remain below LowWatermark for N consecutive checks.
+	RequireConsecutiveLow int `yaml:"require-consecutive-low,omitempty" json:"require-consecutive-low,omitempty"`
+
+	// VerifyAfterImport probes each imported auth once and drops it immediately on explicit invalid statuses.
+	VerifyAfterImport bool `yaml:"verify-after-import,omitempty" json:"verify-after-import,omitempty"`
+
+	// Priority is injected into imported auth JSON files.
+	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
+
+	// Note is injected into imported auth JSON files for operator visibility.
+	Note string `yaml:"note,omitempty" json:"note,omitempty"`
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -627,6 +678,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Sanitize Codex keys: drop entries without base-url
 	cfg.SanitizeCodexKeys()
 
+	// Sanitize Codex auto-refill configuration.
+	cfg.SanitizeCodexAutoRefill()
+
 	// Sanitize Codex header defaults.
 	cfg.SanitizeCodexHeaderDefaults()
 
@@ -809,6 +863,64 @@ func (cfg *Config) SanitizeCodexKeys() {
 		out = append(out, e)
 	}
 	cfg.CodexKey = out
+}
+
+// SanitizeCodexAutoRefill normalizes and bounds automatic Codex auth refill settings.
+func (cfg *Config) SanitizeCodexAutoRefill() {
+	if cfg == nil {
+		return
+	}
+	refill := &cfg.QuotaExceeded.CodexAutoRefill
+	refill.ProviderURL = strings.TrimSpace(refill.ProviderURL)
+	refill.AuthMode = strings.ToLower(strings.TrimSpace(refill.AuthMode))
+	refill.APIKeyEnv = strings.TrimSpace(refill.APIKeyEnv)
+	refill.SessionEnv = strings.TrimSpace(refill.SessionEnv)
+	refill.Note = strings.TrimSpace(refill.Note)
+	if refill.ProviderURL == "" {
+		refill.ProviderURL = "https://gptfreetoken.pony.indevs.in"
+	}
+	if refill.AuthMode == "" {
+		refill.AuthMode = "api-key"
+	}
+	if refill.AuthMode != "api-key" && refill.AuthMode != "session" {
+		refill.AuthMode = "api-key"
+	}
+	if refill.APIKeyEnv == "" {
+		refill.APIKeyEnv = "TOKEN_ATLAS_API_KEY"
+	}
+	if refill.SessionEnv == "" {
+		refill.SessionEnv = "TOKEN_ATLAS_SESSION"
+	}
+	if refill.CheckIntervalSeconds <= 0 {
+		refill.CheckIntervalSeconds = 120
+	}
+	if refill.MinClaimIntervalSeconds <= 0 {
+		refill.MinClaimIntervalSeconds = 900
+	}
+	if refill.TimeoutSeconds <= 0 {
+		refill.TimeoutSeconds = 20
+	}
+	if refill.LowWatermark < 0 {
+		refill.LowWatermark = 0
+	}
+	if refill.TargetReady <= 0 {
+		refill.TargetReady = 3
+	}
+	if refill.TargetReady < refill.LowWatermark {
+		refill.TargetReady = refill.LowWatermark
+	}
+	if refill.MaxClaimPerRun <= 0 {
+		refill.MaxClaimPerRun = 2
+	}
+	if refill.RequireConsecutiveLow <= 0 {
+		refill.RequireConsecutiveLow = 2
+	}
+	if refill.Note == "" {
+		refill.Note = "auto-refill"
+	}
+	if refill.Priority == 0 {
+		refill.Priority = -10
+	}
 }
 
 // SanitizeClaudeKeys normalizes headers for Claude credentials.

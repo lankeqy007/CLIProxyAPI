@@ -15,6 +15,7 @@ MANAGEMENT_PASSWORD_VALUE="${HF_MANAGEMENT_PASSWORD:-${MANAGEMENT_PASSWORD:-}}"
 PGSTORE_DSN_VALUE="${HF_PGSTORE_DSN:-${PGSTORE_DSN:-}}"
 PGSTORE_SCHEMA_VALUE="${HF_PGSTORE_SCHEMA:-${PGSTORE_SCHEMA:-}}"
 PGSTORE_LOCAL_PATH_VALUE="${HF_PGSTORE_LOCAL_PATH:-${PGSTORE_LOCAL_PATH:-}}"
+TOKEN_ATLAS_API_KEY_VALUE="${HF_TOKEN_ATLAS_API_KEY:-${TOKEN_ATLAS_API_KEY:-}}"
 COMMIT_MESSAGE="${HF_COMMIT_MESSAGE:-deploy hf bundle}"
 WAIT_ENABLED="${HF_WAIT:-1}"
 WAIT_MAX="${HF_WAIT_MAX:-50}"
@@ -33,6 +34,7 @@ Optional environment variables:
   HF_PGSTORE_DSN              Set/update the PGSTORE_DSN secret
   HF_PGSTORE_SCHEMA           Set/update the PGSTORE_SCHEMA secret
   HF_PGSTORE_LOCAL_PATH       Set/update the PGSTORE_LOCAL_PATH secret
+  HF_TOKEN_ATLAS_API_KEY      Set/update the TOKEN_ATLAS_API_KEY secret
   HF_COMMIT_MESSAGE           Upload commit message
   HF_RECREATE=1               Delete and recreate the Space before upload
   HF_WAIT=0                   Skip runtime polling after upload
@@ -153,6 +155,7 @@ main() {
   set_space_secret "${SPACE_ID}" "PGSTORE_DSN" "${PGSTORE_DSN_VALUE}"
   set_space_secret "${SPACE_ID}" "PGSTORE_SCHEMA" "${PGSTORE_SCHEMA_VALUE}"
   set_space_secret "${SPACE_ID}" "PGSTORE_LOCAL_PATH" "${PGSTORE_LOCAL_PATH_VALUE}"
+  set_space_secret "${SPACE_ID}" "TOKEN_ATLAS_API_KEY" "${TOKEN_ATLAS_API_KEY_VALUE}"
 
   hf upload "${SPACE_ID}" "${OUTPUT_DIR}" . --repo-type space --commit-message "${COMMIT_MESSAGE}"
 

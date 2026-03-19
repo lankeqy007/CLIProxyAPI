@@ -537,6 +537,9 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/quota-exceeded/switch-preview-model", s.mgmt.GetSwitchPreviewModel)
 		mgmt.PUT("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
 		mgmt.PATCH("/quota-exceeded/switch-preview-model", s.mgmt.PutSwitchPreviewModel)
+		mgmt.GET("/quota-exceeded/codex-auto-refill", s.mgmt.GetCodexAutoRefill)
+		mgmt.PUT("/quota-exceeded/codex-auto-refill", s.mgmt.PutCodexAutoRefill)
+		mgmt.PATCH("/quota-exceeded/codex-auto-refill", s.mgmt.PutCodexAutoRefill)
 
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)

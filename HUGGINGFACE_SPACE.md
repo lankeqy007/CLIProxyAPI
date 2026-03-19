@@ -56,9 +56,18 @@ HF_PGSTORE_LOCAL_PATH=/tmp/app \
 ```env
 CLIENT_API_KEY=<client-auth-key>
 MANAGEMENT_PASSWORD=<strong-secret>
+TOKEN_ATLAS_API_KEY=<codex-refill-api-key>
 ```
 
 `CLIENT_API_KEY` is required for remote use.
+`TOKEN_ATLAS_API_KEY` is required only if you enable `quota-exceeded.codex-auto-refill`.
+
+## Codex Auto Refill
+
+To enable automatic Codex auth-file replenishment on Spaces, turn on `quota-exceeded.codex-auto-refill.enable`
+in your config and set the `TOKEN_ATLAS_API_KEY` secret.
+
+The bundled config templates already include the full `codex-auto-refill` block with safe defaults.
 
 ## Persistence
 

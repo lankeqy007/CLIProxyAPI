@@ -87,6 +87,22 @@ max-retry-interval: 30
 quota-exceeded:
   switch-project: true # Whether to automatically switch to another project when a quota is exceeded
   switch-preview-model: true # Whether to automatically switch to a preview model when a quota is exceeded
+  codex-auto-refill:
+    enable: false # Enable automatic refill for file-backed Codex auths
+    provider-url: "https://gptfreetoken.pony.indevs.in"
+    auth-mode: "api-key" # "api-key" (recommended) or "session"
+    api-key-env: "TOKEN_ATLAS_API_KEY" # Environment variable containing the refill API key
+    session-env: "TOKEN_ATLAS_SESSION" # Environment variable containing token_atlas_session for cookie mode
+    check-interval-seconds: 120 # Evaluate the ready Codex auth pool every 2 minutes
+    min-claim-interval-seconds: 900 # Wait at least 15 minutes between successful claim runs
+    timeout-seconds: 20 # Timeout for claim/download/probe requests
+    low-watermark: 1 # Trigger refill when ready Codex auths stay below this level
+    target-ready: 3 # Try to maintain this many ready Codex auths
+    max-claim-per-run: 2 # Claim at most this many auths per refill run
+    require-consecutive-low: 2 # Require N consecutive low-pool checks before claiming
+    verify-after-import: true # Probe imported auth files once and drop explicit invalid ones
+    priority: -10 # Injected into imported auth JSON files
+    note: "auto-refill" # Injected into imported auth JSON files
 
 # Routing strategy for selecting credentials when multiple match.
 routing:

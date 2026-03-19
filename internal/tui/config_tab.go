@@ -171,7 +171,7 @@ func (m configTabModel) toggleBool(idx int) tea.Cmd {
 		f := m.fields[idx]
 		current := f.value == "true"
 		newValue := !current
-		errPutBool := m.client.PutBoolField(f.apiPath, newValue)
+		errPutBool := m.putConfigFieldValue(f.apiPath, newValue)
 		return configUpdateMsg{
 			path:  f.apiPath,
 			value: newValue,
@@ -195,10 +195,10 @@ func (m configTabModel) submitEdit(idx int, newValue string) tea.Cmd {
 				}
 			}
 			value = valueInt
-			err = m.client.PutIntField(f.apiPath, valueInt)
+			err = m.putConfigFieldValue(f.apiPath, valueInt)
 		case "string":
 			value = newValue
-			err = m.client.PutStringField(f.apiPath, newValue)
+			err = m.putConfigFieldValue(f.apiPath, newValue)
 		}
 		return configUpdateMsg{
 			path:  f.apiPath,
@@ -212,7 +212,36 @@ func configFieldEditValue(f configField) string {
 	if rawString, ok := f.rawValue.(string); ok {
 		return rawString
 	}
+	switch v := f.rawValue.(type) {
+	case bool:
+		if v {
+			return "true"
+		}
+		return "false"
+	case int:
+		return strconv.Itoa(v)
+	case float64:
+		return strconv.Itoa(int(v))
+	}
 	return f.value
+}
+
+func (m configTabModel) putConfigFieldValue(path string, value any) error {
+	const refillPrefix = "quota-exceeded/codex-auto-refill/"
+	if strings.HasPrefix(path, refillPrefix) {
+		field := strings.TrimPrefix(path, refillPrefix)
+		return m.client.PutCodexAutoRefillField(field, value)
+	}
+	switch typed := value.(type) {
+	case bool:
+		return m.client.PutBoolField(path, typed)
+	case int:
+		return m.client.PutIntField(path, typed)
+	case string:
+		return m.client.PutStringField(path, typed)
+	default:
+		return fmt.Errorf("unsupported config value type")
+	}
 }
 
 func (m *configTabModel) SetSize(w, h int) {
@@ -345,6 +374,21 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	// Quota exceeded
 	fields = append(fields, configField{"Switch Project on Quota", "quota-exceeded/switch-project", "bool", fmt.Sprintf("%v", getBoolNested(cfg, "quota-exceeded", "switch-project")), nil})
 	fields = append(fields, configField{"Switch Preview Model", "quota-exceeded/switch-preview-model", "bool", fmt.Sprintf("%v", getBoolNested(cfg, "quota-exceeded", "switch-preview-model")), nil})
+	fields = append(fields, configField{"Codex Auto Refill", "quota-exceeded/codex-auto-refill/enable", "bool", fmt.Sprintf("%v", getBoolNested(cfg, "quota-exceeded", "codex-auto-refill", "enable")), getBoolNested(cfg, "quota-exceeded", "codex-auto-refill", "enable")})
+	fields = append(fields, configField{"Refill Provider URL", "quota-exceeded/codex-auto-refill/provider-url", "string", getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "provider-url"), getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "provider-url")})
+	fields = append(fields, configField{"Refill Auth Mode", "quota-exceeded/codex-auto-refill/auth-mode", "string", getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "auth-mode"), getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "auth-mode")})
+	fields = append(fields, configField{"Refill API Key Env", "quota-exceeded/codex-auto-refill/api-key-env", "string", getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "api-key-env"), getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "api-key-env")})
+	fields = append(fields, configField{"Refill Session Env", "quota-exceeded/codex-auto-refill/session-env", "string", getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "session-env"), getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "session-env")})
+	fields = append(fields, configField{"Refill Check Interval (s)", "quota-exceeded/codex-auto-refill/check-interval-seconds", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "check-interval-seconds")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "check-interval-seconds"))})
+	fields = append(fields, configField{"Refill Min Claim Interval (s)", "quota-exceeded/codex-auto-refill/min-claim-interval-seconds", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "min-claim-interval-seconds")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "min-claim-interval-seconds"))})
+	fields = append(fields, configField{"Refill Timeout (s)", "quota-exceeded/codex-auto-refill/timeout-seconds", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "timeout-seconds")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "timeout-seconds"))})
+	fields = append(fields, configField{"Refill Low Watermark", "quota-exceeded/codex-auto-refill/low-watermark", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "low-watermark")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "low-watermark"))})
+	fields = append(fields, configField{"Refill Target Ready", "quota-exceeded/codex-auto-refill/target-ready", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "target-ready")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "target-ready"))})
+	fields = append(fields, configField{"Refill Max Claim Per Run", "quota-exceeded/codex-auto-refill/max-claim-per-run", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "max-claim-per-run")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "max-claim-per-run"))})
+	fields = append(fields, configField{"Refill Require Consecutive Low", "quota-exceeded/codex-auto-refill/require-consecutive-low", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "require-consecutive-low")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "require-consecutive-low"))})
+	fields = append(fields, configField{"Refill Verify After Import", "quota-exceeded/codex-auto-refill/verify-after-import", "bool", fmt.Sprintf("%v", getBoolNested(cfg, "quota-exceeded", "codex-auto-refill", "verify-after-import")), getBoolNested(cfg, "quota-exceeded", "codex-auto-refill", "verify-after-import")})
+	fields = append(fields, configField{"Refill Imported Priority", "quota-exceeded/codex-auto-refill/priority", "int", fmt.Sprintf("%.0f", getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "priority")), int(getFloatNested(cfg, "quota-exceeded", "codex-auto-refill", "priority"))})
+	fields = append(fields, configField{"Refill Imported Note", "quota-exceeded/codex-auto-refill/note", "string", getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "note"), getStringNested(cfg, "quota-exceeded", "codex-auto-refill", "note")})
 
 	// Routing
 	if routing, ok := cfg["routing"].(map[string]any); ok {
@@ -403,6 +447,40 @@ func getBoolNested(m map[string]any, keys ...string) bool {
 		}
 	}
 	return false
+}
+
+func getNestedMap(m map[string]any, keys ...string) map[string]any {
+	current := m
+	for _, key := range keys {
+		nested, ok := current[key].(map[string]any)
+		if !ok {
+			return nil
+		}
+		current = nested
+	}
+	return current
+}
+
+func getStringNested(m map[string]any, keys ...string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+	parent := getNestedMap(m, keys[:len(keys)-1]...)
+	if parent == nil {
+		return ""
+	}
+	return getString(parent, keys[len(keys)-1])
+}
+
+func getFloatNested(m map[string]any, keys ...string) float64 {
+	if len(keys) == 0 {
+		return 0
+	}
+	parent := getNestedMap(m, keys[:len(keys)-1]...)
+	if parent == nil {
+		return 0
+	}
+	return getFloat(parent, keys[len(keys)-1])
 }
 
 func maskIfNotEmpty(s string) string {

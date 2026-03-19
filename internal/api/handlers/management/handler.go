@@ -27,6 +27,12 @@ type attemptInfo struct {
 	lastActivity time.Time // track last activity for cleanup
 }
 
+type codexAutoRefillState struct {
+	running        bool
+	consecutiveLow int
+	lastClaimAt    time.Time
+}
+
 // attemptCleanupInterval controls how often stale IP entries are purged
 const attemptCleanupInterval = 1 * time.Hour
 
@@ -39,7 +45,9 @@ type Handler struct {
 	configFilePath      string
 	mu                  sync.Mutex
 	attemptsMu          sync.Mutex
+	codexAutoRefillMu   sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
+	codexAutoRefill     codexAutoRefillState
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
@@ -66,6 +74,8 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
+	h.startCodexCredentialSweep()
+	h.startCodexAutoRefill()
 	return h
 }
 
@@ -105,10 +115,24 @@ func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manag
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
-func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
+func (h *Handler) SetConfig(cfg *config.Config) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.cfg = cfg
+	h.mu.Unlock()
+}
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
-func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = manager }
+func (h *Handler) SetAuthManager(manager *coreauth.Manager) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	h.authManager = manager
+	h.mu.Unlock()
+}
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
@@ -296,13 +320,33 @@ func looksLikeHuggingFaceAuthHeader(value string) bool {
 func (h *Handler) persist(c *gin.Context) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// Preserve comments when writing
-	if err := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); err != nil {
+	if err := h.persistConfigLocked(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to save config: %v", err)})
 		return false
 	}
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	return true
+}
+
+func (h *Handler) persistConfigSnapshot() error {
+	if h == nil {
+		return nil
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.persistConfigLocked()
+}
+
+func (h *Handler) persistConfigLocked() error {
+	if h == nil || h.cfg == nil {
+		return nil
+	}
+	configPath := strings.TrimSpace(h.configFilePath)
+	if configPath == "" {
+		return nil
+	}
+	// Preserve comments when writing.
+	return config.SaveConfigPreserveComments(configPath, h.cfg)
 }
 
 // Helper methods for simple types
