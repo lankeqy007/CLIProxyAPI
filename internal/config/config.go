@@ -200,8 +200,14 @@ type CodexAutoRefill struct {
 	// AuthMode selects how the external service is authenticated: "api-key" or "session".
 	AuthMode string `yaml:"auth-mode,omitempty" json:"auth-mode,omitempty"`
 
+	// APIKey stores the external API key directly in config. When present, it takes precedence over env lookup.
+	APIKey string `yaml:"api-key,omitempty" json:"api-key,omitempty"`
+
 	// APIKeyEnv names the environment variable that contains the external API key.
 	APIKeyEnv string `yaml:"api-key-env,omitempty" json:"api-key-env,omitempty"`
+
+	// SessionValue stores token_atlas_session directly in config. When present, it takes precedence over env lookup.
+	SessionValue string `yaml:"session-value,omitempty" json:"session-value,omitempty"`
 
 	// SessionEnv names the environment variable that contains token_atlas_session for cookie auth.
 	SessionEnv string `yaml:"session-env,omitempty" json:"session-env,omitempty"`
@@ -873,7 +879,9 @@ func (cfg *Config) SanitizeCodexAutoRefill() {
 	refill := &cfg.QuotaExceeded.CodexAutoRefill
 	refill.ProviderURL = strings.TrimSpace(refill.ProviderURL)
 	refill.AuthMode = strings.ToLower(strings.TrimSpace(refill.AuthMode))
+	refill.APIKey = strings.TrimSpace(refill.APIKey)
 	refill.APIKeyEnv = strings.TrimSpace(refill.APIKeyEnv)
+	refill.SessionValue = strings.TrimSpace(refill.SessionValue)
 	refill.SessionEnv = strings.TrimSpace(refill.SessionEnv)
 	refill.Note = strings.TrimSpace(refill.Note)
 	if refill.ProviderURL == "" {
@@ -884,12 +892,6 @@ func (cfg *Config) SanitizeCodexAutoRefill() {
 	}
 	if refill.AuthMode != "api-key" && refill.AuthMode != "session" {
 		refill.AuthMode = "api-key"
-	}
-	if refill.APIKeyEnv == "" {
-		refill.APIKeyEnv = "TOKEN_ATLAS_API_KEY"
-	}
-	if refill.SessionEnv == "" {
-		refill.SessionEnv = "TOKEN_ATLAS_SESSION"
 	}
 	if refill.CheckIntervalSeconds <= 0 {
 		refill.CheckIntervalSeconds = 120

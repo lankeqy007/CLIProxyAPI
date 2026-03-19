@@ -31,7 +31,9 @@ quota-exceeded:
     enable: false
     provider-url: "https://gptfreetoken.pony.indevs.in"
     auth-mode: "api-key"
+    api-key: ""
     api-key-env: "TOKEN_ATLAS_API_KEY"
+    session-value: ""
     session-env: "TOKEN_ATLAS_SESSION"
     check-interval-seconds: 120
     min-claim-interval-seconds: 900

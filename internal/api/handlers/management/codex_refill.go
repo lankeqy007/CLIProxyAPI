@@ -22,12 +22,16 @@ import (
 )
 
 const codexAutoRefillWorkerFallbackInterval = 2 * time.Minute
+const codexAutoRefillDefaultAPIKeyEnv = "TOKEN_ATLAS_API_KEY"
+const codexAutoRefillDefaultSessionEnv = "TOKEN_ATLAS_SESSION"
 
 type codexAutoRefillRuntimeConfig struct {
 	Enable                bool
 	ProviderURL           string
 	AuthMode              string
+	APIKey                string
 	APIKeyEnv             string
+	SessionValue          string
 	SessionEnv            string
 	CheckInterval         time.Duration
 	MinClaimInterval      time.Duration
@@ -101,12 +105,6 @@ func (h *Handler) currentCodexAutoRefillRuntimeConfig() codexAutoRefillRuntimeCo
 	if strings.TrimSpace(refill.AuthMode) == "" {
 		refill.AuthMode = "api-key"
 	}
-	if strings.TrimSpace(refill.APIKeyEnv) == "" {
-		refill.APIKeyEnv = "TOKEN_ATLAS_API_KEY"
-	}
-	if strings.TrimSpace(refill.SessionEnv) == "" {
-		refill.SessionEnv = "TOKEN_ATLAS_SESSION"
-	}
 	if refill.CheckIntervalSeconds <= 0 {
 		refill.CheckIntervalSeconds = 120
 	}
@@ -141,7 +139,9 @@ func (h *Handler) currentCodexAutoRefillRuntimeConfig() codexAutoRefillRuntimeCo
 		Enable:                refill.Enable,
 		ProviderURL:           strings.TrimSpace(refill.ProviderURL),
 		AuthMode:              strings.ToLower(strings.TrimSpace(refill.AuthMode)),
+		APIKey:                strings.TrimSpace(refill.APIKey),
 		APIKeyEnv:             strings.TrimSpace(refill.APIKeyEnv),
+		SessionValue:          strings.TrimSpace(refill.SessionValue),
 		SessionEnv:            strings.TrimSpace(refill.SessionEnv),
 		CheckInterval:         time.Duration(refill.CheckIntervalSeconds) * time.Second,
 		MinClaimInterval:      time.Duration(refill.MinClaimIntervalSeconds) * time.Second,
@@ -356,10 +356,32 @@ func (h *Handler) codexAutoRefillClaimAndImport(ctx context.Context, manager *co
 	return imported, nil
 }
 
+func resolveCodexAutoRefillSecret(directValue string, envName string, fallbackEnvName string, label string, configKey string) (string, error) {
+	if value := strings.TrimSpace(directValue); value != "" {
+		return value, nil
+	}
+
+	targetEnvName := strings.TrimSpace(envName)
+	if targetEnvName == "" {
+		targetEnvName = fallbackEnvName
+	}
+	if value := strings.TrimSpace(os.Getenv(targetEnvName)); value != "" {
+		return value, nil
+	}
+
+	return "", fmt.Errorf("missing %s: set %s or env %s", label, configKey, targetEnvName)
+}
+
 func (h *Handler) codexAutoRefillClaimWithAPIKey(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, count int) ([]codexAutoRefillDownloadedFile, error) {
-	apiKey := strings.TrimSpace(os.Getenv(runtimeCfg.APIKeyEnv))
-	if apiKey == "" {
-		return nil, fmt.Errorf("missing api key env %s", runtimeCfg.APIKeyEnv)
+	apiKey, err := resolveCodexAutoRefillSecret(
+		runtimeCfg.APIKey,
+		runtimeCfg.APIKeyEnv,
+		codexAutoRefillDefaultAPIKeyEnv,
+		"codex auto-refill api key",
+		"quota-exceeded.codex-auto-refill.api-key",
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	requestBody, _ := json.Marshal(map[string]int{"count": count})
@@ -393,9 +415,15 @@ func (h *Handler) codexAutoRefillClaimWithAPIKey(ctx context.Context, runtimeCfg
 }
 
 func (h *Handler) codexAutoRefillClaimWithSession(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, count int) ([]codexAutoRefillDownloadedFile, error) {
-	session := strings.TrimSpace(os.Getenv(runtimeCfg.SessionEnv))
-	if session == "" {
-		return nil, fmt.Errorf("missing session env %s", runtimeCfg.SessionEnv)
+	session, err := resolveCodexAutoRefillSecret(
+		runtimeCfg.SessionValue,
+		runtimeCfg.SessionEnv,
+		codexAutoRefillDefaultSessionEnv,
+		"codex auto-refill session",
+		"quota-exceeded.codex-auto-refill.session-value",
+	)
+	if err != nil {
+		return nil, err
 	}
 
 	requestBody, _ := json.Marshal(map[string]int{"count": count})

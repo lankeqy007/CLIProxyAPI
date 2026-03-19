@@ -91,8 +91,10 @@ quota-exceeded:
     enable: false # Enable automatic refill for file-backed Codex auths
     provider-url: "https://gptfreetoken.pony.indevs.in"
     auth-mode: "api-key" # "api-key" (recommended) or "session"
-    api-key-env: "TOKEN_ATLAS_API_KEY" # Environment variable containing the refill API key
-    session-env: "TOKEN_ATLAS_SESSION" # Environment variable containing token_atlas_session for cookie mode
+    api-key: "" # Optional direct refill API key saved in config; takes precedence over env lookup
+    api-key-env: "TOKEN_ATLAS_API_KEY" # Optional environment variable fallback for the refill API key
+    session-value: "" # Optional direct token_atlas_session saved in config; takes precedence over env lookup
+    session-env: "TOKEN_ATLAS_SESSION" # Optional environment variable fallback for token_atlas_session cookie mode
     check-interval-seconds: 120 # Evaluate the ready Codex auth pool every 2 minutes
     min-claim-interval-seconds: 900 # Wait at least 15 minutes between successful claim runs
     timeout-seconds: 20 # Timeout for claim/download/probe requests

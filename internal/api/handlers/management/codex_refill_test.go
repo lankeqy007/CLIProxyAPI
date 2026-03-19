@@ -1,6 +1,8 @@
 package management
 
 import (
+	"archive/zip"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -174,4 +176,140 @@ func TestRunCodexAutoRefill_SkipsWhenReadyEnough(t *testing.T) {
 	if requestCount.Load() != 0 {
 		t.Fatalf("unexpected refill requests: %d", requestCount.Load())
 	}
+}
+
+func TestRunCodexAutoRefill_UsesDirectAPIKeyWithoutEnv(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	var claimCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/claim":
+			claimCalls.Add(1)
+			if got := r.Header.Get("X-API-Key"); got != "direct-token" {
+				t.Fatalf("claim api key = %q, want %q", got, "direct-token")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"claims":[{"token_id":"201"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/download/201":
+			w.Header().Set("Content-Disposition", `attachment; filename="direct.json"`)
+			_, _ = w.Write([]byte(`{"type":"codex","email":"direct@example.com","account_id":"acc-direct","refresh_token":"r1"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	authDir := t.TempDir()
+	cfg := &config.Config{
+		AuthDir: authDir,
+		QuotaExceeded: config.QuotaExceeded{
+			CodexAutoRefill: config.CodexAutoRefill{
+				Enable:                  true,
+				ProviderURL:             server.URL,
+				AuthMode:                "api-key",
+				APIKey:                  "direct-token",
+				CheckIntervalSeconds:    1,
+				MinClaimIntervalSeconds: 1,
+				TimeoutSeconds:          5,
+				LowWatermark:            1,
+				TargetReady:             1,
+				MaxClaimPerRun:          1,
+				RequireConsecutiveLow:   1,
+			},
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	h.runCodexAutoRefill()
+
+	if claimCalls.Load() != 1 {
+		t.Fatalf("claim calls = %d, want 1", claimCalls.Load())
+	}
+	if len(manager.List()) != 1 {
+		t.Fatalf("imported auth count = %d, want 1", len(manager.List()))
+	}
+}
+
+func TestRunCodexAutoRefill_UsesDirectSessionWithoutEnv(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	archiveBody := buildCodexAutoRefillArchive(t, map[string]string{
+		"session.json": `{"type":"codex","email":"session@example.com","account_id":"acc-session","refresh_token":"r1"}`,
+	})
+
+	var claimCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cookie, err := r.Cookie("token_atlas_session")
+		if err != nil {
+			t.Fatalf("expected session cookie: %v", err)
+		}
+		if cookie.Value != "session-token" {
+			t.Fatalf("session cookie = %q, want %q", cookie.Value, "session-token")
+		}
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/me/claim":
+			claimCalls.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/me/claims/archive":
+			w.Header().Set("Content-Type", "application/zip")
+			_, _ = w.Write(archiveBody)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	authDir := t.TempDir()
+	cfg := &config.Config{
+		AuthDir: authDir,
+		QuotaExceeded: config.QuotaExceeded{
+			CodexAutoRefill: config.CodexAutoRefill{
+				Enable:                  true,
+				ProviderURL:             server.URL,
+				AuthMode:                "session",
+				SessionValue:            "session-token",
+				CheckIntervalSeconds:    1,
+				MinClaimIntervalSeconds: 1,
+				TimeoutSeconds:          5,
+				LowWatermark:            1,
+				TargetReady:             1,
+				MaxClaimPerRun:          1,
+				RequireConsecutiveLow:   1,
+			},
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	h.runCodexAutoRefill()
+
+	if claimCalls.Load() != 1 {
+		t.Fatalf("claim calls = %d, want 1", claimCalls.Load())
+	}
+	if len(manager.List()) != 1 {
+		t.Fatalf("imported auth count = %d, want 1", len(manager.List()))
+	}
+}
+
+func buildCodexAutoRefillArchive(t *testing.T, files map[string]string) []byte {
+	t.Helper()
+
+	var buffer bytes.Buffer
+	writer := zip.NewWriter(&buffer)
+	for name, body := range files {
+		fileWriter, err := writer.Create(name)
+		if err != nil {
+			t.Fatalf("create zip entry %s: %v", name, err)
+		}
+		if _, err := fileWriter.Write([]byte(body)); err != nil {
+			t.Fatalf("write zip entry %s: %v", name, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close zip writer: %v", err)
+	}
+	return buffer.Bytes()
 }

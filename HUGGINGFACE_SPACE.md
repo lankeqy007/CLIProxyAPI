@@ -60,12 +60,19 @@ TOKEN_ATLAS_API_KEY=<codex-refill-api-key>
 ```
 
 `CLIENT_API_KEY` is required for remote use.
-`TOKEN_ATLAS_API_KEY` is required only if you enable `quota-exceeded.codex-auto-refill`.
+`TOKEN_ATLAS_API_KEY` is optional and only used when you enable `quota-exceeded.codex-auto-refill`
+without storing the refill API key directly in config.
 
 ## Codex Auto Refill
 
-To enable automatic Codex auth-file replenishment on Spaces, turn on `quota-exceeded.codex-auto-refill.enable`
-in your config and set the `TOKEN_ATLAS_API_KEY` secret.
+To enable automatic Codex auth-file replenishment on Spaces, turn on
+`quota-exceeded.codex-auto-refill.enable` in your config.
+
+You can either:
+
+- save `quota-exceeded.codex-auto-refill.api-key` or `session-value` directly in config, or
+- keep the secret in `TOKEN_ATLAS_API_KEY` / `TOKEN_ATLAS_SESSION` and reference it through
+  `api-key-env` / `session-env`.
 
 The bundled config templates already include the full `codex-auto-refill` block with safe defaults.
 
