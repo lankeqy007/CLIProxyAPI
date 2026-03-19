@@ -60,6 +60,9 @@ Get 10% OFF GLM CODING PLAN：https://z.ai/subscribe?ic=8JVLJQFSKB
 
 CLIProxyAPI Guides: [https://help.router-for.me/](https://help.router-for.me/)
 
+Container deployment for Docker, Hugging Face Spaces, Render, and Supabase: [docs/docker-deployment.md](docs/docker-deployment.md)
+Hugging Face specific notes: [HUGGINGFACE_SPACE.md](HUGGINGFACE_SPACE.md)
+
 ## Management API
 
 see [MANAGEMENT_API.md](https://help.router-for.me/management/api)

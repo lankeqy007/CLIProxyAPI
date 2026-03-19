@@ -1,5 +1,5 @@
 // Package claude provides authentication functionality for Anthropic's Claude API.
-// This file implements a custom HTTP transport using utls to bypass TLS fingerprinting.
+// This file implements a custom HTTP transport using utls for browser-like TLS handshakes.
 package claude
 
 import (
@@ -15,8 +15,7 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// utlsRoundTripper implements http.RoundTripper using utls with Chrome fingerprint
-// to bypass Cloudflare's TLS fingerprinting on Anthropic domains.
+// utlsRoundTripper implements http.RoundTripper using utls with a Chrome-like fingerprint.
 type utlsRoundTripper struct {
 	// mu protects the connections map and pending map
 	mu sync.Mutex

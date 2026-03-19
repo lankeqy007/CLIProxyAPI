@@ -317,6 +317,8 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 // setupRoutes configures the API routes for the server.
 // It defines the endpoints and associates them with their respective handlers.
 func (s *Server) setupRoutes() {
+	s.engine.GET("/healthz", s.handleHealth)
+	s.engine.GET("/readyz", s.handleHealth)
 	s.engine.GET("/management.html", s.serveManagementControlPanel)
 	openaiHandlers := openai.NewOpenAIAPIHandler(s.handlers)
 	geminiHandlers := gemini.NewGeminiAPIHandler(s.handlers)
@@ -434,6 +436,13 @@ func (s *Server) setupRoutes() {
 	})
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
+}
+
+func (s *Server) handleHealth(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"status":  "ok",
+		"service": "CLIProxyAPI",
+	})
 }
 
 // AttachWebsocketRoute registers a websocket upgrade handler on the primary Gin engine.
@@ -1032,7 +1041,24 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 			return
 		}
 
-		result, err := manager.Authenticate(c.Request.Context(), c.Request)
+		req := c.Request
+		if req != nil {
+			// Some hosted edges consume Authorization for their own access control.
+			// Forward the client credential in a secondary header so the app can still authenticate requests.
+			forwardedAuth := strings.TrimSpace(req.Header.Get("X-Forwarded-Authorization"))
+			if forwardedAuth != "" {
+				authHeader := strings.TrimSpace(req.Header.Get("Authorization"))
+				if authHeader == "" || looksLikeHuggingFaceAuthHeader(authHeader) {
+					cloned := req.Clone(req.Context())
+					cloned.Header = cloned.Header.Clone()
+					cloned.Header.Set("Authorization", forwardedAuth)
+					req = cloned
+					c.Request = cloned
+				}
+			}
+		}
+
+		result, err := manager.Authenticate(req.Context(), req)
 		if err == nil {
 			if result != nil {
 				c.Set("apiKey", result.Principal)
@@ -1051,4 +1077,16 @@ func AuthMiddleware(manager *sdkaccess.Manager) gin.HandlerFunc {
 		}
 		c.AbortWithStatusJSON(statusCode, gin.H{"error": err.Message})
 	}
+}
+
+func looksLikeHuggingFaceAuthHeader(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "bearer ") {
+		trimmed = strings.TrimSpace(trimmed[len("bearer "):])
+	}
+	return strings.HasPrefix(trimmed, "hf_")
 }

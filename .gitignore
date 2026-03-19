@@ -12,6 +12,7 @@ logs/*
 conv/*
 temp/*
 refs/*
+.dist/*
 
 # Storage backends
 pgstore/*
@@ -27,6 +28,7 @@ auths/*
 
 # Documentation
 docs/*
+!docs/docker-deployment.md
 AGENTS.md
 CLAUDE.md
 GEMINI.md

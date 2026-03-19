@@ -1,0 +1,24 @@
+# Minimal configuration used to bootstrap Hugging Face Docker Spaces.
+# The entrypoint replaces __AUTH_DIR__ with a writable runtime path.
+
+host: ""
+port: 8317
+
+remote-management:
+  allow-remote: false
+  secret-key: ""
+  disable-control-panel: false
+
+auth-dir: "__AUTH_DIR__"
+
+api-keys: []
+
+debug: false
+
+pprof:
+  enable: false
+  addr: "127.0.0.1:8316"
+
+commercial-mode: false
+logging-to-file: false
+usage-statistics-enabled: false

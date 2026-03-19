@@ -209,7 +209,15 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		// Accept either Authorization: Bearer <key> or X-Management-Key
 		var provided string
-		if ah := c.GetHeader("Authorization"); ah != "" {
+		ah := strings.TrimSpace(c.GetHeader("Authorization"))
+		if forwarded := strings.TrimSpace(c.GetHeader("X-Forwarded-Authorization")); forwarded != "" {
+			// Hosted edges may use Authorization for their own access control.
+			// Accept a forwarded management key so the app can validate the original credential.
+			if ah == "" || looksLikeHuggingFaceAuthHeader(ah) {
+				ah = forwarded
+			}
+		}
+		if ah != "" {
 			parts := strings.SplitN(ah, " ", 2)
 			if len(parts) == 2 && strings.ToLower(parts[0]) == "bearer" {
 				provided = parts[1]
@@ -218,7 +226,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 			}
 		}
 		if provided == "" {
-			provided = c.GetHeader("X-Management-Key")
+			provided = strings.TrimSpace(c.GetHeader("X-Management-Key"))
 		}
 
 		if provided == "" {
@@ -270,6 +278,18 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+func looksLikeHuggingFaceAuthHeader(value string) bool {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if strings.HasPrefix(lower, "bearer ") {
+		trimmed = strings.TrimSpace(trimmed[len("bearer "):])
+	}
+	return strings.HasPrefix(trimmed, "hf_")
 }
 
 // persist saves the current in-memory config to disk.

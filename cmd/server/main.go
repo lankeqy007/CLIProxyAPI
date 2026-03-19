@@ -224,12 +224,7 @@ func main() {
 		objectStoreLocalPath = value
 	}
 
-	// Check for cloud deploy mode only on first execution
-	// Read env var name in uppercase: DEPLOY
-	deployEnv := os.Getenv("DEPLOY")
-	if deployEnv == "cloud" {
-		isCloudDeploy = true
-	}
+	isCloudDeploy = config.IsCloudDeployEnv()
 
 	// Determine and load the configuration file.
 	// Prefer the Postgres store when configured, otherwise fallback to git or local files.
@@ -394,6 +389,10 @@ func main() {
 	if cfg == nil {
 		cfg = &config.Config{}
 	}
+	if errApplyRuntime := config.ApplyRuntimeEnv(cfg); errApplyRuntime != nil {
+		log.Errorf("failed to apply runtime environment overrides: %v", errApplyRuntime)
+		return
+	}
 
 	// In cloud deploy mode, check if we have a valid configuration
 	var configFileExists bool
@@ -415,6 +414,14 @@ func main() {
 			configFileExists = true
 		}
 	}
+
+	// Cloud deploy safety: when no request auth providers are configured, the server allows all
+	// requests (legacy behavior). On managed platforms this is almost always a foot-gun.
+	if isCloudDeploy && configFileExists && len(cfg.APIKeys) == 0 {
+		log.Error("cloud deploy mode: no client API keys configured. Set CLIENT_API_KEY (or CLIENT_API_KEYS) environment variable or populate 'api-keys' in config.yaml.")
+		return
+	}
+
 	usage.SetStatisticsEnabled(cfg.UsageStatisticsEnabled)
 	coreauth.SetQuotaCooldownDisabled(cfg.DisableCooling)
 

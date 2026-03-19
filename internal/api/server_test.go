@@ -112,6 +112,24 @@ func TestAmpProviderModelRoutes(t *testing.T) {
 	}
 }
 
+func TestHealthEndpointsDoNotRequireAuth(t *testing.T) {
+	server := newTestServer(t)
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rr := httptest.NewRecorder()
+
+		server.engine.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Fatalf("unexpected status code for %s: got %d want %d", path, rr.Code, http.StatusOK)
+		}
+		if body := rr.Body.String(); !strings.Contains(body, `"status":"ok"`) {
+			t.Fatalf("response body for %s missing healthy status: %s", path, body)
+		}
+	}
+}
+
 func TestDefaultRequestLoggerFactory_UsesResolvedLogDirectory(t *testing.T) {
 	t.Setenv("WRITABLE_PATH", "")
 	t.Setenv("writable_path", "")
