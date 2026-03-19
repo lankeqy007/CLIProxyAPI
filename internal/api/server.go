@@ -671,6 +671,9 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+	c.Header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 
 	if bundledPath := strings.TrimSpace(os.Getenv("MANAGEMENT_BUNDLED_PATH")); bundledPath != "" {
 		if _, err := os.Stat(bundledPath); err == nil {

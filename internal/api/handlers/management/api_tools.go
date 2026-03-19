@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,11 +16,14 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 )
 
 const defaultAPICallTimeout = 60 * time.Second
+
+const codexQuotaUsagePath = "/backend-api/wham/usage"
 
 const (
 	geminiOAuthClientID     = "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com"
@@ -208,11 +212,218 @@ func (h *Handler) APICall(c *gin.Context) {
 		return
 	}
 
+	h.recordCodexQuotaRefreshResult(auth, method, parsedURL, resp.StatusCode, resp.Header, respBody)
+
 	c.JSON(http.StatusOK, apiCallResponse{
 		StatusCode: resp.StatusCode,
 		Header:     resp.Header,
 		Body:       string(respBody),
 	})
+}
+
+func (h *Handler) recordCodexQuotaRefreshResult(auth *coreauth.Auth, method string, parsedURL *url.URL, statusCode int, header http.Header, body []byte) {
+	if h == nil || h.authManager == nil || !isCodexQuotaRefreshRequest(auth, method, parsedURL) {
+		return
+	}
+
+	now := time.Now()
+	if statusCode >= http.StatusOK && statusCode < http.StatusMultipleChoices {
+		h.persistCodexQuotaRefreshSuccess(auth, now)
+		return
+	}
+
+	resultErr := codexQuotaRefreshError(statusCode, body)
+	retryAfter := retryAfterFromHeader(header, now)
+	h.persistCodexQuotaRefreshFailure(auth, resultErr, retryAfter, now)
+
+	if decision, shouldDelete := codexSweepDeleteDecision(auth, now); shouldDelete {
+		path := h.codexSweepTargetPath(auth)
+		if errDelete := h.deleteCodexAuthFile(context.Background(), auth, path); errDelete != nil {
+			log.WithError(errDelete).Warnf("management codex quota refresh: failed to remove auth=%s status=%d reason=%s file=%s", strings.TrimSpace(auth.ID), decision.status, decision.reason, path)
+			return
+		}
+		log.Warnf("management codex quota refresh: removed auth=%s status=%d reason=%s file=%s", strings.TrimSpace(auth.ID), decision.status, decision.reason, path)
+	}
+}
+
+func isCodexQuotaRefreshRequest(auth *coreauth.Auth, method string, parsedURL *url.URL) bool {
+	if auth == nil || parsedURL == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(method), http.MethodGet) {
+		return false
+	}
+
+	host := strings.ToLower(strings.TrimSpace(parsedURL.Hostname()))
+	if host != "chatgpt.com" {
+		return false
+	}
+
+	path := strings.TrimSpace(parsedURL.EscapedPath())
+	if path == "" {
+		path = strings.TrimSpace(parsedURL.Path)
+	}
+	path = strings.TrimRight(path, "/")
+	if path == "" {
+		path = "/"
+	}
+	return path == codexQuotaUsagePath
+}
+
+func (h *Handler) persistCodexQuotaRefreshSuccess(auth *coreauth.Auth, now time.Time) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	auth.Unavailable = false
+	auth.Status = coreauth.StatusActive
+	auth.StatusMessage = ""
+	auth.Quota = coreauth.QuotaState{}
+	auth.LastError = nil
+	auth.NextRetryAfter = time.Time{}
+	auth.LastRefreshedAt = now
+	auth.UpdatedAt = now
+	_, _ = h.authManager.Update(context.Background(), auth)
+}
+
+func (h *Handler) persistCodexQuotaRefreshFailure(auth *coreauth.Auth, resultErr *coreauth.Error, retryAfter *time.Duration, now time.Time) {
+	if h == nil || h.authManager == nil || auth == nil {
+		return
+	}
+	prevRecoverAt := auth.Quota.NextRecoverAt
+	auth.Unavailable = true
+	auth.Status = coreauth.StatusError
+	auth.UpdatedAt = now
+	auth.LastError = cloneCoreAuthError(resultErr)
+	auth.Quota.Exceeded = false
+	auth.Quota.Reason = ""
+	auth.Quota.NextRecoverAt = time.Time{}
+	auth.Quota.BackoffLevel = 0
+	auth.NextRetryAfter = time.Time{}
+	if resultErr != nil && strings.TrimSpace(resultErr.Message) != "" {
+		auth.StatusMessage = strings.TrimSpace(resultErr.Message)
+	} else {
+		auth.StatusMessage = ""
+	}
+
+	statusCode := 0
+	if resultErr != nil {
+		statusCode = resultErr.StatusCode()
+	}
+
+	switch statusCode {
+	case http.StatusUnauthorized:
+		auth.StatusMessage = "unauthorized"
+		auth.NextRetryAfter = now.Add(30 * time.Minute)
+	case http.StatusPaymentRequired, http.StatusForbidden:
+		auth.StatusMessage = "payment_required"
+		auth.NextRetryAfter = now.Add(30 * time.Minute)
+	case http.StatusNotFound:
+		auth.StatusMessage = "not_found"
+		auth.NextRetryAfter = now.Add(12 * time.Hour)
+	case http.StatusTooManyRequests:
+		auth.StatusMessage = "quota exhausted"
+		auth.Quota.Exceeded = true
+		auth.Quota.Reason = "quota"
+		next := now.Add(5 * time.Minute)
+		if retryAfter != nil {
+			next = now.Add(*retryAfter)
+		} else if !prevRecoverAt.IsZero() && prevRecoverAt.After(now) {
+			next = prevRecoverAt
+		}
+		auth.Quota.NextRecoverAt = next
+		auth.NextRetryAfter = next
+	case http.StatusRequestTimeout, http.StatusInternalServerError, http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout:
+		auth.StatusMessage = "transient upstream error"
+		if retryAfter != nil {
+			auth.NextRetryAfter = now.Add(*retryAfter)
+		} else {
+			auth.NextRetryAfter = now.Add(1 * time.Minute)
+		}
+	default:
+		if auth.StatusMessage == "" {
+			auth.StatusMessage = "request failed"
+		}
+	}
+
+	_, _ = h.authManager.Update(context.Background(), auth)
+}
+
+func cloneCoreAuthError(err *coreauth.Error) *coreauth.Error {
+	if err == nil {
+		return nil
+	}
+	return &coreauth.Error{
+		Code:       err.Code,
+		Message:    err.Message,
+		Retryable:  err.Retryable,
+		HTTPStatus: err.HTTPStatus,
+	}
+}
+
+func codexQuotaRefreshError(statusCode int, body []byte) *coreauth.Error {
+	message := firstNonEmptyJSONText(body, "error.message", "message", "detail", "error")
+	code := firstNonEmptyJSONText(body, "error.code", "code", "error.type", "type")
+	if message == "" {
+		message = compactAPIErrorMessage(string(body))
+	}
+	if message == "" {
+		message = strings.TrimSpace(http.StatusText(statusCode))
+	}
+	return &coreauth.Error{
+		Code:       code,
+		Message:    message,
+		Retryable:  statusCode == http.StatusRequestTimeout || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError,
+		HTTPStatus: statusCode,
+	}
+}
+
+func firstNonEmptyJSONText(body []byte, paths ...string) string {
+	if len(body) == 0 {
+		return ""
+	}
+	for _, path := range paths {
+		value := strings.TrimSpace(gjson.GetBytes(body, path).String())
+		if value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func compactAPIErrorMessage(raw string) string {
+	raw = strings.Join(strings.Fields(strings.TrimSpace(raw)), " ")
+	if len(raw) <= 512 {
+		return raw
+	}
+	return raw[:512]
+}
+
+func retryAfterFromHeader(header http.Header, now time.Time) *time.Duration {
+	if len(header) == 0 {
+		return nil
+	}
+	raw := strings.TrimSpace(header.Get("Retry-After"))
+	if raw == "" {
+		return nil
+	}
+	if seconds, errParse := strconv.Atoi(raw); errParse == nil {
+		if seconds < 0 {
+			seconds = 0
+		}
+		retryAfter := time.Duration(seconds) * time.Second
+		return &retryAfter
+	}
+	if ts, errParse := http.ParseTime(raw); errParse == nil {
+		retryAfter := ts.Sub(now)
+		if retryAfter < 0 {
+			retryAfter = 0
+		}
+		return &retryAfter
+	}
+	return nil
 }
 
 func firstNonEmptyString(values ...*string) string {
