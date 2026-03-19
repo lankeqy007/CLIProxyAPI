@@ -690,6 +690,16 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
+	} else {
+		// Best-effort background refresh keeps existing deployments from getting stuck on a stale
+		// management asset when the startup sync previously failed. Internal throttling prevents
+		// this from hitting GitHub on every request.
+		go managementasset.EnsureLatestManagementHTML(
+			context.Background(),
+			managementasset.StaticDir(s.configFilePath),
+			cfg.ProxyURL,
+			cfg.RemoteManagement.PanelGitHubRepository,
+		)
 	}
 
 	c.File(filePath)
