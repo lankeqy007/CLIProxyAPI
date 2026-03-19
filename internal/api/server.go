@@ -671,6 +671,14 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		c.AbortWithStatus(http.StatusNotFound)
 		return
 	}
+
+	if bundledPath := strings.TrimSpace(os.Getenv("MANAGEMENT_BUNDLED_PATH")); bundledPath != "" {
+		if _, err := os.Stat(bundledPath); err == nil {
+			c.File(bundledPath)
+			return
+		}
+	}
+
 	filePath := managementasset.FilePath(s.configFilePath)
 	if strings.TrimSpace(filePath) == "" {
 		c.AbortWithStatus(http.StatusNotFound)

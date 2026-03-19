@@ -30,6 +30,7 @@ fi
 
 if [ -f "${APP_DIR}/management.html" ]; then
   cp "${APP_DIR}/management.html" "${STATIC_FILE}"
+  export MANAGEMENT_BUNDLED_PATH="${APP_DIR}/management.html"
   export MANAGEMENT_STATIC_PATH="${STATIC_FILE}"
 fi
 
