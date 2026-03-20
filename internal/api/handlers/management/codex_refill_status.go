@@ -79,6 +79,15 @@ func (h *Handler) setCodexAutoRefillNextCheck(nextCheckAt time.Time) {
 	h.codexAutoRefillMu.Unlock()
 }
 
+func (h *Handler) currentCodexAutoRefillProviderQuotaSnapshot() codexAutoRefillProviderQuotaSnapshot {
+	if h == nil {
+		return codexAutoRefillProviderQuotaSnapshot{}
+	}
+	h.codexAutoRefillMu.Lock()
+	defer h.codexAutoRefillMu.Unlock()
+	return h.codexAutoRefill.providerQuota
+}
+
 func (h *Handler) codexAutoRefillLog(level string, event string, message string, enrich func(*codexAutoRefillLogEntry)) {
 	if h == nil {
 		return

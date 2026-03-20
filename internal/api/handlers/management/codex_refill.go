@@ -460,7 +460,9 @@ func (h *Handler) runCodexAutoRefillWithTrigger(trigger string) {
 		}
 		return
 	}
-	defer h.endCodexAutoRefillRun(time.Now())
+	defer func() {
+		h.endCodexAutoRefillRun(time.Now())
+	}()
 
 	pool := h.codexAutoRefillPool(now)
 	h.observeCodexAutoRefill(now, trigger, pool, "")

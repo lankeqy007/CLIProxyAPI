@@ -192,7 +192,7 @@ type QuotaExceeded struct {
 // CodexAutoRefill configures background claim/download/import of file-backed Codex auths
 // when the ready credential pool falls below the desired watermark.
 type CodexAutoRefill struct {
-	Enable bool `yaml:"enable,omitempty" json:"enable,omitempty"`
+	Enable bool `yaml:"enable" json:"enable"`
 
 	// ProviderURL points at the external claim/download service base URL.
 	ProviderURL string `yaml:"provider-url,omitempty" json:"provider-url,omitempty"`
@@ -239,7 +239,7 @@ type CodexAutoRefill struct {
 	RequireConsecutiveLow int `yaml:"require-consecutive-low,omitempty" json:"require-consecutive-low,omitempty"`
 
 	// VerifyAfterImport probes each imported auth once and drops it immediately on explicit invalid statuses.
-	VerifyAfterImport bool `yaml:"verify-after-import,omitempty" json:"verify-after-import,omitempty"`
+	VerifyAfterImport bool `yaml:"verify-after-import" json:"verify-after-import"`
 
 	// Priority is injected into imported auth JSON files.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
