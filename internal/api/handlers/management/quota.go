@@ -2,6 +2,7 @@ package management
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -35,4 +36,17 @@ func (h *Handler) PutCodexAutoRefill(c *gin.Context) {
 	h.cfg.QuotaExceeded.CodexAutoRefill = body
 	h.cfg.SanitizeCodexAutoRefill()
 	h.persist(c)
+}
+
+func (h *Handler) GetCodexAutoRefillStatus(c *gin.Context) {
+	now := time.Now()
+	runtimeCfg := h.currentCodexAutoRefillRuntimeConfig()
+	providerQuota := h.codexAutoRefillProviderQuotaStatus(c.Request.Context(), runtimeCfg, now)
+	status := h.codexAutoRefillStatusSnapshot(runtimeCfg, h.codexAutoRefillPool(now), providerQuota, now)
+	c.JSON(http.StatusOK, gin.H{"status": status})
+}
+
+func (h *Handler) TriggerCodexAutoRefill(c *gin.Context) {
+	go h.runCodexAutoRefillWithTrigger("manual")
+	c.JSON(http.StatusAccepted, gin.H{"status": "accepted"})
 }

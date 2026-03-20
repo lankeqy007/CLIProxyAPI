@@ -28,9 +28,26 @@ type attemptInfo struct {
 }
 
 type codexAutoRefillState struct {
-	running        bool
-	consecutiveLow int
-	lastClaimAt    time.Time
+	running           bool
+	consecutiveLow    int
+	lastClaimAt       time.Time
+	lastCheckAt       time.Time
+	nextCheckAt       time.Time
+	lastRunStartedAt  time.Time
+	lastRunFinishedAt time.Time
+	lastSuccessAt     time.Time
+	lastErrorAt       time.Time
+	lastError         string
+	lastSkipReason    string
+	lastTrigger       string
+	lastRequested     int
+	lastImported      int
+	lastObservedPool  codexAutoRefillPoolSnapshot
+	hourlyWindowStart time.Time
+	hourlyClaimed     int
+	providerQuota     codexAutoRefillProviderQuotaSnapshot
+	providerQuotaKey  string
+	logs              []codexAutoRefillLogEntry
 }
 
 // attemptCleanupInterval controls how often stale IP entries are purged

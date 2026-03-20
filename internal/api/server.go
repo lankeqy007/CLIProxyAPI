@@ -540,6 +540,8 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/quota-exceeded/codex-auto-refill", s.mgmt.GetCodexAutoRefill)
 		mgmt.PUT("/quota-exceeded/codex-auto-refill", s.mgmt.PutCodexAutoRefill)
 		mgmt.PATCH("/quota-exceeded/codex-auto-refill", s.mgmt.PutCodexAutoRefill)
+		mgmt.GET("/quota-exceeded/codex-auto-refill/status", s.mgmt.GetCodexAutoRefillStatus)
+		mgmt.POST("/quota-exceeded/codex-auto-refill/run", s.mgmt.TriggerCodexAutoRefill)
 
 		mgmt.GET("/api-keys", s.mgmt.GetAPIKeys)
 		mgmt.PUT("/api-keys", s.mgmt.PutAPIKeys)

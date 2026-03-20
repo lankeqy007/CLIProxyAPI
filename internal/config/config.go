@@ -230,6 +230,10 @@ type CodexAutoRefill struct {
 	// MaxClaimPerRun limits how many credentials may be claimed in a single refill run.
 	MaxClaimPerRun int `yaml:"max-claim-per-run,omitempty" json:"max-claim-per-run,omitempty"`
 
+	// HourlyClaimLimit caps how many auth files may be claimed within a rolling one-hour window.
+	// Zero or negative disables the hourly limit.
+	HourlyClaimLimit int `yaml:"hourly-claim-limit,omitempty" json:"hourly-claim-limit,omitempty"`
+
 	// RequireConsecutiveLow requires the pool to remain below LowWatermark for N consecutive checks.
 	RequireConsecutiveLow int `yaml:"require-consecutive-low,omitempty" json:"require-consecutive-low,omitempty"`
 
@@ -913,6 +917,9 @@ func (cfg *Config) SanitizeCodexAutoRefill() {
 	}
 	if refill.MaxClaimPerRun <= 0 {
 		refill.MaxClaimPerRun = 2
+	}
+	if refill.HourlyClaimLimit < 0 {
+		refill.HourlyClaimLimit = 0
 	}
 	if refill.RequireConsecutiveLow <= 0 {
 		refill.RequireConsecutiveLow = 2

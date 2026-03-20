@@ -101,6 +101,7 @@ quota-exceeded:
     low-watermark: 1 # Trigger refill when ready Codex auths stay below this level
     target-ready: 3 # Try to maintain this many ready Codex auths
     max-claim-per-run: 2 # Claim at most this many auths per refill run
+    hourly-claim-limit: 0 # Rolling 1-hour cap against the external refill service; 0 disables the cap
     require-consecutive-low: 2 # Require N consecutive low-pool checks before claiming
     verify-after-import: true # Only drop imported auth files when existing CPA runtime state already marks them fatally invalid
     priority: -10 # Injected into imported auth JSON files

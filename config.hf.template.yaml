@@ -41,6 +41,7 @@ quota-exceeded:
     low-watermark: 1
     target-ready: 3
     max-claim-per-run: 2
+    hourly-claim-limit: 0
     require-consecutive-low: 2
     verify-after-import: true
     priority: -10

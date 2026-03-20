@@ -4,6 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -24,6 +27,8 @@ import (
 const codexAutoRefillWorkerFallbackInterval = 2 * time.Minute
 const codexAutoRefillDefaultAPIKeyEnv = "TOKEN_ATLAS_API_KEY"
 const codexAutoRefillDefaultSessionEnv = "TOKEN_ATLAS_SESSION"
+const codexAutoRefillDefaultDownloadConcurrency = 4
+const codexAutoRefillProviderQuotaCacheTTL = time.Minute
 
 type codexAutoRefillRuntimeConfig struct {
 	Enable                bool
@@ -39,6 +44,7 @@ type codexAutoRefillRuntimeConfig struct {
 	LowWatermark          int
 	TargetReady           int
 	MaxClaimPerRun        int
+	HourlyClaimLimit      int
 	RequireConsecutiveLow int
 	VerifyAfterImport     bool
 	Priority              int
@@ -77,8 +83,9 @@ func (h *Handler) startCodexAutoRefill() {
 				interval = codexAutoRefillWorkerFallbackInterval
 			}
 			timer := time.NewTimer(interval)
+			h.setCodexAutoRefillNextCheck(time.Now().Add(interval))
 			<-timer.C
-			h.runCodexAutoRefill()
+			h.runCodexAutoRefillWithTrigger("scheduled")
 		}
 	}()
 }
@@ -126,6 +133,9 @@ func (h *Handler) currentCodexAutoRefillRuntimeConfig() codexAutoRefillRuntimeCo
 	if refill.MaxClaimPerRun <= 0 {
 		refill.MaxClaimPerRun = 2
 	}
+	if refill.HourlyClaimLimit < 0 {
+		refill.HourlyClaimLimit = 0
+	}
 	if refill.RequireConsecutiveLow <= 0 {
 		refill.RequireConsecutiveLow = 2
 	}
@@ -149,6 +159,7 @@ func (h *Handler) currentCodexAutoRefillRuntimeConfig() codexAutoRefillRuntimeCo
 		LowWatermark:          refill.LowWatermark,
 		TargetReady:           refill.TargetReady,
 		MaxClaimPerRun:        refill.MaxClaimPerRun,
+		HourlyClaimLimit:      refill.HourlyClaimLimit,
 		RequireConsecutiveLow: refill.RequireConsecutiveLow,
 		VerifyAfterImport:     refill.VerifyAfterImport,
 		Priority:              refill.Priority,
@@ -158,34 +169,349 @@ func (h *Handler) currentCodexAutoRefillRuntimeConfig() codexAutoRefillRuntimeCo
 	}
 }
 
+func (h *Handler) codexAutoRefillProviderQuotaStatus(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, now time.Time) codexAutoRefillProviderQuotaSnapshot {
+	cacheKey := codexAutoRefillProviderQuotaCacheKey(runtimeCfg)
+	if snapshot, ok := h.cachedCodexAutoRefillProviderQuota(cacheKey, now); ok {
+		return snapshot
+	}
+
+	snapshot := h.fetchCodexAutoRefillProviderQuota(ctx, runtimeCfg, now)
+	h.storeCodexAutoRefillProviderQuota(cacheKey, snapshot)
+	return snapshot
+}
+
+func (h *Handler) cachedCodexAutoRefillProviderQuota(cacheKey string, now time.Time) (codexAutoRefillProviderQuotaSnapshot, bool) {
+	if h == nil {
+		return codexAutoRefillProviderQuotaSnapshot{}, false
+	}
+
+	h.codexAutoRefillMu.Lock()
+	defer h.codexAutoRefillMu.Unlock()
+
+	snapshot := h.codexAutoRefill.providerQuota
+	if cacheKey == "" || h.codexAutoRefill.providerQuotaKey != cacheKey || snapshot.FetchedAt.IsZero() {
+		return codexAutoRefillProviderQuotaSnapshot{}, false
+	}
+	if now.Sub(snapshot.FetchedAt) >= codexAutoRefillProviderQuotaCacheTTL {
+		return codexAutoRefillProviderQuotaSnapshot{}, false
+	}
+	return snapshot, true
+}
+
+func (h *Handler) storeCodexAutoRefillProviderQuota(cacheKey string, snapshot codexAutoRefillProviderQuotaSnapshot) {
+	if h == nil {
+		return
+	}
+	h.codexAutoRefillMu.Lock()
+	h.codexAutoRefill.providerQuota = snapshot
+	h.codexAutoRefill.providerQuotaKey = cacheKey
+	h.codexAutoRefillMu.Unlock()
+}
+
+func (h *Handler) fetchCodexAutoRefillProviderQuota(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, now time.Time) codexAutoRefillProviderQuotaSnapshot {
+	authMode := strings.TrimSpace(runtimeCfg.AuthMode)
+	if authMode == "" {
+		authMode = "api-key"
+	}
+	snapshot := codexAutoRefillProviderQuotaSnapshot{
+		Supported: authMode == "session",
+		Endpoint:  "/me",
+		AuthMode:  authMode,
+		FetchedAt: now.UTC(),
+	}
+	if authMode != "session" {
+		snapshot.Error = "GET /me currently requires session auth mode"
+		return snapshot
+	}
+
+	session, err := resolveCodexAutoRefillSecret(
+		runtimeCfg.SessionValue,
+		runtimeCfg.SessionEnv,
+		codexAutoRefillDefaultSessionEnv,
+		"codex auto-refill session",
+		"quota-exceeded.codex-auto-refill.session-value",
+	)
+	if err != nil {
+		snapshot.Error = err.Error()
+		return snapshot
+	}
+
+	responseBody, _, err := h.codexAutoRefillRequest(ctx, runtimeCfg, http.MethodGet, "/me", nil, func(req *http.Request) {
+		req.AddCookie(&http.Cookie{Name: "token_atlas_session", Value: session})
+	})
+	if err != nil {
+		snapshot.Error = err.Error()
+		return snapshot
+	}
+
+	payload, err := decodeCodexAutoRefillProviderQuota(responseBody)
+	if err != nil {
+		snapshot.Error = err.Error()
+		return snapshot
+	}
+
+	snapshot.Raw = payload
+	populateCodexAutoRefillProviderQuota(&snapshot, payload)
+	return snapshot
+}
+
+func codexAutoRefillProviderQuotaCacheKey(runtimeCfg codexAutoRefillRuntimeConfig) string {
+	baseURL := strings.TrimRight(strings.TrimSpace(runtimeCfg.ProviderURL), "/")
+	authMode := strings.TrimSpace(runtimeCfg.AuthMode)
+	if authMode == "" {
+		authMode = "api-key"
+	}
+	if authMode != "session" {
+		return baseURL + "|" + authMode
+	}
+
+	session, err := resolveCodexAutoRefillSecret(
+		runtimeCfg.SessionValue,
+		runtimeCfg.SessionEnv,
+		codexAutoRefillDefaultSessionEnv,
+		"codex auto-refill session",
+		"quota-exceeded.codex-auto-refill.session-value",
+	)
+	if err != nil {
+		return baseURL + "|" + authMode + "|missing"
+	}
+	return baseURL + "|" + authMode + "|" + codexAutoRefillSecretHash(session)
+}
+
+func codexAutoRefillSecretHash(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func decodeCodexAutoRefillProviderQuota(raw []byte) (map[string]any, error) {
+	var payload any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return nil, fmt.Errorf("decode provider /me response: %w", err)
+	}
+	object, ok := payload.(map[string]any)
+	if ok {
+		return object, nil
+	}
+	return map[string]any{"value": payload}, nil
+}
+
+func populateCodexAutoRefillProviderQuota(snapshot *codexAutoRefillProviderQuotaSnapshot, payload map[string]any) {
+	if snapshot == nil || payload == nil {
+		return
+	}
+
+	userMap := codexAutoRefillFirstMap(payload, "user", "me", "profile", "account")
+	quotaMap := codexAutoRefillFirstMap(payload, "quota", "allowance", "limits")
+	claimsMap := codexAutoRefillFirstMap(payload, "claims", "claim_stats", "statistics", "stats", "usage")
+
+	snapshot.UserID = codexAutoRefillFirstString([]map[string]any{userMap, payload}, "id", "user_id", "uid")
+	snapshot.Username = codexAutoRefillFirstString([]map[string]any{userMap, payload}, "name", "username", "login", "nickname", "display_name")
+	snapshot.Email = codexAutoRefillFirstString([]map[string]any{userMap, payload}, "email", "mail")
+	snapshot.QuotaRemaining = codexAutoRefillFirstInt64([]map[string]any{quotaMap, claimsMap, payload}, "remaining", "remaining_count", "quota_remaining", "available", "available_count", "hourly_remaining")
+	snapshot.QuotaUsed = codexAutoRefillFirstInt64([]map[string]any{quotaMap, claimsMap, payload}, "used", "used_count", "quota_used", "claimed", "claim_count", "hourly_used")
+	snapshot.QuotaLimit = codexAutoRefillFirstInt64([]map[string]any{quotaMap, claimsMap, payload}, "limit", "total", "max", "quota", "quota_limit", "hourly_limit")
+	snapshot.ClaimCount = codexAutoRefillFirstInt64([]map[string]any{claimsMap, payload}, "count", "claimed", "claimed_count", "issued", "received")
+	snapshot.ClaimLimit = codexAutoRefillFirstInt64([]map[string]any{claimsMap, quotaMap, payload}, "limit", "max", "total", "claim_limit", "hourly_limit")
+
+	if snapshot.ClaimCount == nil {
+		if list, ok := payload["claims"].([]any); ok {
+			count := int64(len(list))
+			snapshot.ClaimCount = &count
+		}
+	}
+}
+
+func codexAutoRefillFirstMap(payload map[string]any, keys ...string) map[string]any {
+	for _, key := range keys {
+		value, ok := payload[key]
+		if !ok {
+			continue
+		}
+		if typed, ok := value.(map[string]any); ok {
+			return typed
+		}
+	}
+	return nil
+}
+
+func codexAutoRefillFirstString(candidates []map[string]any, keys ...string) string {
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		for _, key := range keys {
+			value, ok := candidate[key]
+			if !ok {
+				continue
+			}
+			switch typed := value.(type) {
+			case string:
+				if text := strings.TrimSpace(typed); text != "" {
+					return text
+				}
+			case fmt.Stringer:
+				if text := strings.TrimSpace(typed.String()); text != "" {
+					return text
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func codexAutoRefillFirstInt64(candidates []map[string]any, keys ...string) *int64 {
+	for _, candidate := range candidates {
+		if candidate == nil {
+			continue
+		}
+		for _, key := range keys {
+			value, ok := candidate[key]
+			if !ok {
+				continue
+			}
+			if parsed, ok := codexAutoRefillToInt64(value); ok {
+				result := parsed
+				return &result
+			}
+		}
+	}
+	return nil
+}
+
+func codexAutoRefillToInt64(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int:
+		return int64(typed), true
+	case int8:
+		return int64(typed), true
+	case int16:
+		return int64(typed), true
+	case int32:
+		return int64(typed), true
+	case int64:
+		return typed, true
+	case uint:
+		return int64(typed), true
+	case uint8:
+		return int64(typed), true
+	case uint16:
+		return int64(typed), true
+	case uint32:
+		return int64(typed), true
+	case uint64:
+		if typed > uint64(^uint64(0)>>1) {
+			return 0, false
+		}
+		return int64(typed), true
+	case float32:
+		return int64(typed), true
+	case float64:
+		return int64(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	case string:
+		text := strings.TrimSpace(typed)
+		if text == "" {
+			return 0, false
+		}
+		var parsed int64
+		if _, err := fmt.Sscan(text, &parsed); err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
 func (h *Handler) runCodexAutoRefill() {
+	h.runCodexAutoRefillWithTrigger("scheduled")
+}
+
+func (h *Handler) runCodexAutoRefillWithTrigger(trigger string) {
 	runtimeCfg := h.currentCodexAutoRefillRuntimeConfig()
+	now := time.Now()
 	if !runtimeCfg.Enable || runtimeCfg.AuthDir == "" {
+		h.observeCodexAutoRefill(now, trigger, codexAutoRefillPoolSnapshot{}, "auto-refill disabled or auth-dir is empty")
+		if trigger == "manual" {
+			h.codexAutoRefillLog("info", "skip", "manual refill skipped because auto-refill is disabled or auth-dir is empty", func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+			})
+		}
 		h.resetCodexAutoRefillLow()
 		return
 	}
 	manager := h.currentAuthManager()
 	if manager == nil {
+		h.observeCodexAutoRefill(now, trigger, codexAutoRefillPoolSnapshot{}, "core auth manager unavailable")
+		if trigger == "manual" {
+			h.codexAutoRefillLog("warn", "skip", "manual refill skipped because core auth manager is unavailable", func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+			})
+		}
 		return
 	}
 	if !h.beginCodexAutoRefillRun() {
+		h.observeCodexAutoRefill(now, trigger, codexAutoRefillPoolSnapshot{}, "another refill run is already in progress")
+		if trigger == "manual" {
+			h.codexAutoRefillLog("info", "skip", "manual refill skipped because another run is already in progress", func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+			})
+		}
 		return
 	}
-	defer h.endCodexAutoRefillRun()
+	defer h.endCodexAutoRefillRun(time.Now())
 
-	now := time.Now()
 	pool := h.codexAutoRefillPool(now)
+	h.observeCodexAutoRefill(now, trigger, pool, "")
+	h.markCodexAutoRefillRunStarted(now, trigger, pool)
 	if pool.ReadyCount >= runtimeCfg.LowWatermark {
+		skipReason := fmt.Sprintf("ready pool is healthy (%d >= %d)", pool.ReadyCount, runtimeCfg.LowWatermark)
+		h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+		if trigger == "manual" {
+			h.codexAutoRefillLog("info", "skip", "manual refill skipped because ready pool is already healthy", func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+				entry.ReadyCount = pool.ReadyCount
+				entry.CoolingCount = pool.CoolingCount
+				entry.UnavailableCount = pool.UnavailableCount
+				entry.DisabledCount = pool.DisabledCount
+				entry.TotalCount = pool.TotalCount
+			})
+		}
 		h.resetCodexAutoRefillLow()
 		return
 	}
 
 	lowCount := h.incrementCodexAutoRefillLow()
 	if lowCount < runtimeCfg.RequireConsecutiveLow {
+		skipReason := fmt.Sprintf("ready=%d below low-watermark=%d but only %d/%d consecutive low checks observed", pool.ReadyCount, runtimeCfg.LowWatermark, lowCount, runtimeCfg.RequireConsecutiveLow)
+		h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+		h.codexAutoRefillLog("info", "low-watermark", skipReason, func(entry *codexAutoRefillLogEntry) {
+			entry.Trigger = trigger
+			entry.ReadyCount = pool.ReadyCount
+			entry.CoolingCount = pool.CoolingCount
+			entry.UnavailableCount = pool.UnavailableCount
+			entry.DisabledCount = pool.DisabledCount
+			entry.TotalCount = pool.TotalCount
+		})
 		log.Debugf("management codex auto-refill: ready=%d below low-watermark=%d (%d/%d)", pool.ReadyCount, runtimeCfg.LowWatermark, lowCount, runtimeCfg.RequireConsecutiveLow)
 		return
 	}
 	if !h.codexAutoRefillCanClaim(now, runtimeCfg.MinClaimInterval) {
+		skipReason := fmt.Sprintf("minimum claim interval not reached (%s)", runtimeCfg.MinClaimInterval)
+		h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+		h.codexAutoRefillLog("info", "skip", skipReason, func(entry *codexAutoRefillLogEntry) {
+			entry.Trigger = trigger
+			entry.ReadyCount = pool.ReadyCount
+			entry.CoolingCount = pool.CoolingCount
+			entry.UnavailableCount = pool.UnavailableCount
+			entry.DisabledCount = pool.DisabledCount
+			entry.TotalCount = pool.TotalCount
+		})
 		return
 	}
 
@@ -197,18 +523,87 @@ func (h *Handler) runCodexAutoRefill() {
 		missing = runtimeCfg.MaxClaimPerRun
 	}
 	if missing <= 0 {
+		skipReason := fmt.Sprintf("no refill needed after applying target and max-claim rules (target=%d ready=%d)", runtimeCfg.TargetReady, pool.ReadyCount)
+		h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+		h.codexAutoRefillLog("info", "skip", skipReason, func(entry *codexAutoRefillLogEntry) {
+			entry.Trigger = trigger
+			entry.ReadyCount = pool.ReadyCount
+			entry.CoolingCount = pool.CoolingCount
+			entry.UnavailableCount = pool.UnavailableCount
+			entry.DisabledCount = pool.DisabledCount
+			entry.TotalCount = pool.TotalCount
+		})
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), runtimeCfg.Timeout)
-	imported, err := h.codexAutoRefillClaimAndImport(ctx, manager, runtimeCfg, missing)
-	cancel()
+	if runtimeCfg.HourlyClaimLimit > 0 {
+		claimedThisHour, hourlyRemaining, _, _ := h.codexAutoRefillHourlyAllowance(now, runtimeCfg.HourlyClaimLimit)
+		if hourlyRemaining <= 0 {
+			skipReason := fmt.Sprintf("hourly claim limit reached (%d/%d used in the last hour)", claimedThisHour, runtimeCfg.HourlyClaimLimit)
+			h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+			h.codexAutoRefillLog("warn", "hourly-limit", skipReason, func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+				entry.ReadyCount = pool.ReadyCount
+				entry.CoolingCount = pool.CoolingCount
+				entry.UnavailableCount = pool.UnavailableCount
+				entry.DisabledCount = pool.DisabledCount
+				entry.TotalCount = pool.TotalCount
+			})
+			return
+		}
+		if missing > hourlyRemaining {
+			h.codexAutoRefillLog("info", "hourly-limit", fmt.Sprintf("refill request capped by hourly limit: requested=%d allowed=%d", missing, hourlyRemaining), func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+				entry.RequestedCount = missing
+			})
+			missing = hourlyRemaining
+		}
+	}
+	if missing <= 0 {
+		return
+	}
+
+	h.codexAutoRefillLog("info", "run-start", fmt.Sprintf("starting codex auto-refill (%s)", formatCodexAutoRefillPoolMessage(pool)), func(entry *codexAutoRefillLogEntry) {
+		entry.Trigger = trigger
+		entry.RequestedCount = missing
+		entry.ReadyCount = pool.ReadyCount
+		entry.CoolingCount = pool.CoolingCount
+		entry.UnavailableCount = pool.UnavailableCount
+		entry.DisabledCount = pool.DisabledCount
+		entry.TotalCount = pool.TotalCount
+	})
+
+	imported, err := h.codexAutoRefillClaimAndImport(context.Background(), manager, runtimeCfg, missing)
 	if err != nil {
+		finishedAt := time.Now()
+		h.markCodexAutoRefillFailure(finishedAt, "", err, missing)
+		h.codexAutoRefillLog("warn", "run-failed", fmt.Sprintf("claim/import failed: %v", err), func(entry *codexAutoRefillLogEntry) {
+			entry.Trigger = trigger
+			entry.RequestedCount = missing
+			entry.ReadyCount = pool.ReadyCount
+			entry.CoolingCount = pool.CoolingCount
+			entry.UnavailableCount = pool.UnavailableCount
+			entry.DisabledCount = pool.DisabledCount
+			entry.TotalCount = pool.TotalCount
+			entry.Error = err.Error()
+		})
 		log.WithError(err).Warnf("management codex auto-refill: claim/import failed ready=%d cooling=%d unavailable=%d total=%d", pool.ReadyCount, pool.CoolingCount, pool.UnavailableCount, pool.TotalCount)
 		return
 	}
 
-	h.markCodexAutoRefillClaimed(now)
+	finishedAt := time.Now()
+	h.markCodexAutoRefillClaimed(finishedAt, missing)
+	h.markCodexAutoRefillSuccess(finishedAt, missing, imported)
+	h.codexAutoRefillLog("info", "run-success", fmt.Sprintf("refill completed: imported=%d requested=%d", imported, missing), func(entry *codexAutoRefillLogEntry) {
+		entry.Trigger = trigger
+		entry.RequestedCount = missing
+		entry.ImportedCount = imported
+		entry.ReadyCount = pool.ReadyCount
+		entry.CoolingCount = pool.CoolingCount
+		entry.UnavailableCount = pool.UnavailableCount
+		entry.DisabledCount = pool.DisabledCount
+		entry.TotalCount = pool.TotalCount
+	})
 	log.Infof("management codex auto-refill: imported=%d requested=%d ready=%d cooling=%d unavailable=%d total=%d", imported, missing, pool.ReadyCount, pool.CoolingCount, pool.UnavailableCount, pool.TotalCount)
 }
 
@@ -225,12 +620,13 @@ func (h *Handler) beginCodexAutoRefillRun() bool {
 	return true
 }
 
-func (h *Handler) endCodexAutoRefillRun() {
+func (h *Handler) endCodexAutoRefillRun(finishedAt time.Time) {
 	if h == nil {
 		return
 	}
 	h.codexAutoRefillMu.Lock()
 	h.codexAutoRefill.running = false
+	h.codexAutoRefill.lastRunFinishedAt = finishedAt
 	h.codexAutoRefillMu.Unlock()
 }
 
@@ -265,11 +661,18 @@ func (h *Handler) codexAutoRefillCanClaim(now time.Time, minInterval time.Durati
 	return now.Sub(h.codexAutoRefill.lastClaimAt) >= minInterval
 }
 
-func (h *Handler) markCodexAutoRefillClaimed(now time.Time) {
+func (h *Handler) markCodexAutoRefillClaimed(now time.Time, claimedCount int) {
 	if h == nil {
 		return
 	}
 	h.codexAutoRefillMu.Lock()
+	if claimedCount > 0 {
+		if h.codexAutoRefill.hourlyWindowStart.IsZero() || now.Sub(h.codexAutoRefill.hourlyWindowStart) >= time.Hour {
+			h.codexAutoRefill.hourlyWindowStart = now
+			h.codexAutoRefill.hourlyClaimed = 0
+		}
+		h.codexAutoRefill.hourlyClaimed += claimedCount
+	}
 	h.codexAutoRefill.lastClaimAt = now
 	h.codexAutoRefill.consecutiveLow = 0
 	h.codexAutoRefillMu.Unlock()
@@ -338,16 +741,24 @@ func (h *Handler) codexAutoRefillClaimAndImport(ctx context.Context, manager *co
 	for _, file := range files {
 		auth, importedOne, errImport := h.importCodexAutoRefillFile(ctx, manager, runtimeCfg, file.Name, file.Data)
 		if errImport != nil {
+			h.codexAutoRefillLog("warn", "import-failed", fmt.Sprintf("failed to import %s: %v", strings.TrimSpace(file.Name), errImport), func(entry *codexAutoRefillLogEntry) {
+				entry.Error = errImport.Error()
+			})
 			log.WithError(errImport).Warnf("management codex auto-refill: failed to import %s", strings.TrimSpace(file.Name))
 			continue
 		}
 		if !importedOne {
+			h.codexAutoRefillLog("info", "import-skipped", fmt.Sprintf("skipped duplicate or already-known auth file %s", strings.TrimSpace(file.Name)), nil)
 			continue
 		}
 		imported++
+		h.codexAutoRefillLog("info", "import-success", fmt.Sprintf("imported auth file %s", strings.TrimSpace(file.Name)), nil)
 		if runtimeCfg.VerifyAfterImport && auth != nil {
 			if decision, shouldDelete := codexSweepDeleteDecision(auth, time.Now()); shouldDelete {
 				_ = h.deleteCodexAuthFile(context.Background(), auth, h.codexSweepTargetPath(auth))
+				h.codexAutoRefillLog("warn", "verify-drop", fmt.Sprintf("dropped imported auth %s after verification (%s)", strings.TrimSpace(file.Name), decision.reason), func(entry *codexAutoRefillLogEntry) {
+					entry.Error = decision.reason
+				})
 				log.Warnf("management codex auto-refill: dropped imported auth=%s status=%d reason=%s", strings.TrimSpace(auth.ID), decision.status, decision.reason)
 				imported--
 			}
@@ -396,22 +807,132 @@ func (h *Handler) codexAutoRefillClaimWithAPIKey(ctx context.Context, runtimeCfg
 	if len(tokenIDs) == 0 {
 		return nil, fmt.Errorf("claim response contained no token ids")
 	}
+	h.codexAutoRefillLog("info", "claim-response", fmt.Sprintf("provider returned %d token ids", len(tokenIDs)), func(entry *codexAutoRefillLogEntry) {
+		entry.RequestedCount = len(tokenIDs)
+		entry.Path = "/api/claim"
+		entry.Method = http.MethodPost
+	})
+	concurrency := codexAutoRefillDownloadConcurrency(len(tokenIDs))
+	h.codexAutoRefillLog("info", "download-start", fmt.Sprintf("downloading %d auth files from provider with concurrency=%d", len(tokenIDs), concurrency), func(entry *codexAutoRefillLogEntry) {
+		entry.Method = http.MethodGet
+		entry.Path = "/api/download/:token_id"
+		entry.RequestedCount = len(tokenIDs)
+	})
+	files, err := h.codexAutoRefillDownloadFiles(ctx, runtimeCfg, tokenIDs, concurrency, func(req *http.Request) {
+		req.Header.Set("X-API-Key", apiKey)
+	})
+	if err != nil {
+		return nil, err
+	}
+	h.codexAutoRefillLog("info", "download-complete", fmt.Sprintf("downloaded %d auth files from provider", len(files)), func(entry *codexAutoRefillLogEntry) {
+		entry.Method = http.MethodGet
+		entry.Path = "/api/download/:token_id"
+		entry.RequestedCount = len(files)
+	})
+	return files, nil
+}
 
-	files := make([]codexAutoRefillDownloadedFile, 0, len(tokenIDs))
-	for _, tokenID := range tokenIDs {
-		body, headers, errDownload := h.codexAutoRefillRequest(ctx, runtimeCfg, http.MethodGet, "/api/download/"+tokenID, nil, func(req *http.Request) {
-			req.Header.Set("X-API-Key", apiKey)
-		})
-		if errDownload != nil {
-			return nil, errDownload
+func codexAutoRefillDownloadConcurrency(total int) int {
+	if total <= 1 {
+		return 1
+	}
+	if total < codexAutoRefillDefaultDownloadConcurrency {
+		return total
+	}
+	return codexAutoRefillDefaultDownloadConcurrency
+}
+
+func (h *Handler) codexAutoRefillDownloadFiles(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, tokenIDs []string, concurrency int, decorate func(*http.Request)) ([]codexAutoRefillDownloadedFile, error) {
+	if len(tokenIDs) == 0 {
+		return nil, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if concurrency <= 1 {
+		files := make([]codexAutoRefillDownloadedFile, 0, len(tokenIDs))
+		for _, tokenID := range tokenIDs {
+			file, err := h.codexAutoRefillDownloadFile(ctx, runtimeCfg, tokenID, decorate)
+			if err != nil {
+				return nil, err
+			}
+			files = append(files, file)
 		}
-		name := fileNameFromContentDisposition(headers.Get("Content-Disposition"))
-		if name == "" {
-			name = "token-" + tokenID + ".json"
+		return files, nil
+	}
+	if concurrency > len(tokenIDs) {
+		concurrency = len(tokenIDs)
+	}
+
+	type downloadResult struct {
+		index int
+		file  codexAutoRefillDownloadedFile
+	}
+
+	downloadCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan int, len(tokenIDs))
+	results := make(chan downloadResult, len(tokenIDs))
+	for index := range tokenIDs {
+		jobs <- index
+	}
+	close(jobs)
+
+	var (
+		wg       sync.WaitGroup
+		firstErr error
+		errOnce  sync.Once
+	)
+
+	worker := func() {
+		defer wg.Done()
+		for index := range jobs {
+			if downloadCtx.Err() != nil {
+				return
+			}
+			file, err := h.codexAutoRefillDownloadFile(downloadCtx, runtimeCfg, tokenIDs[index], decorate)
+			if err != nil {
+				errOnce.Do(func() {
+					firstErr = err
+					cancel()
+				})
+				return
+			}
+			results <- downloadResult{index: index, file: file}
 		}
-		files = append(files, codexAutoRefillDownloadedFile{Name: name, Data: body})
+	}
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go worker()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	files := make([]codexAutoRefillDownloadedFile, len(tokenIDs))
+	for result := range results {
+		files[result.index] = result.file
+	}
+	if firstErr != nil {
+		return nil, firstErr
 	}
 	return files, nil
+}
+
+func (h *Handler) codexAutoRefillDownloadFile(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, tokenID string, decorate func(*http.Request)) (codexAutoRefillDownloadedFile, error) {
+	body, headers, err := h.codexAutoRefillRequest(ctx, runtimeCfg, http.MethodGet, "/api/download/"+tokenID, nil, decorate)
+	if err != nil {
+		return codexAutoRefillDownloadedFile{}, err
+	}
+	name := fileNameFromContentDisposition(headers.Get("Content-Disposition"))
+	if name == "" {
+		name = "token-" + tokenID + ".json"
+	}
+	return codexAutoRefillDownloadedFile{Name: name, Data: body}, nil
 }
 
 func (h *Handler) codexAutoRefillClaimWithSession(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, count int) ([]codexAutoRefillDownloadedFile, error) {
@@ -439,7 +960,16 @@ func (h *Handler) codexAutoRefillClaimWithSession(ctx context.Context, runtimeCf
 	if err != nil {
 		return nil, err
 	}
-	return unzipCodexAutoRefillArchive(archiveBody)
+	files, err := unzipCodexAutoRefillArchive(archiveBody)
+	if err != nil {
+		return nil, err
+	}
+	h.codexAutoRefillLog("info", "download-complete", fmt.Sprintf("downloaded %d auth files from session archive", len(files)), func(entry *codexAutoRefillLogEntry) {
+		entry.Method = http.MethodGet
+		entry.Path = "/me/claims/archive"
+		entry.RequestedCount = len(files)
+	})
+	return files, nil
 }
 
 func (h *Handler) codexAutoRefillRequest(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, method string, path string, body []byte, decorate func(*http.Request)) ([]byte, http.Header, error) {
@@ -452,7 +982,16 @@ func (h *Handler) codexAutoRefillRequest(ctx context.Context, runtimeCfg codexAu
 	if body != nil {
 		reader = bytes.NewReader(body)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, targetURL, reader)
+	requestCtx := ctx
+	if requestCtx == nil {
+		requestCtx = context.Background()
+	}
+	var cancel context.CancelFunc
+	if runtimeCfg.Timeout > 0 {
+		requestCtx, cancel = context.WithTimeout(requestCtx, runtimeCfg.Timeout)
+		defer cancel()
+	}
+	req, err := http.NewRequestWithContext(requestCtx, method, targetURL, reader)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -462,10 +1001,26 @@ func (h *Handler) codexAutoRefillRequest(ctx context.Context, runtimeCfg codexAu
 	if decorate != nil {
 		decorate(req)
 	}
+	startedAt := time.Now()
+	h.codexAutoRefillLog("info", "provider-request", fmt.Sprintf("requesting refill provider %s %s", method, path), func(entry *codexAutoRefillLogEntry) {
+		entry.Method = method
+		entry.Path = path
+	})
 
-	client := util.SetProxy(&runtimeCfg.SDKConfig, &http.Client{Timeout: runtimeCfg.Timeout})
+	clientTimeout := runtimeCfg.Timeout
+	if clientTimeout <= 0 {
+		clientTimeout = 20 * time.Second
+	}
+	client := util.SetProxy(&runtimeCfg.SDKConfig, &http.Client{Timeout: clientTimeout})
 	resp, err := client.Do(req)
 	if err != nil {
+		elapsedMs := time.Since(startedAt).Milliseconds()
+		h.codexAutoRefillLog("warn", "provider-request-failed", fmt.Sprintf("refill provider request failed for %s %s", method, path), func(entry *codexAutoRefillLogEntry) {
+			entry.Method = method
+			entry.Path = path
+			entry.DurationMs = elapsedMs
+			entry.Error = err.Error()
+		})
 		return nil, nil, err
 	}
 	defer func() {
@@ -473,11 +1028,33 @@ func (h *Handler) codexAutoRefillRequest(ctx context.Context, runtimeCfg codexAu
 	}()
 	responseBody, err := io.ReadAll(resp.Body)
 	if err != nil {
+		elapsedMs := time.Since(startedAt).Milliseconds()
+		h.codexAutoRefillLog("warn", "provider-response-read-failed", fmt.Sprintf("failed to read refill provider response body for %s %s", method, path), func(entry *codexAutoRefillLogEntry) {
+			entry.Method = method
+			entry.Path = path
+			entry.StatusCode = resp.StatusCode
+			entry.DurationMs = elapsedMs
+			entry.Error = err.Error()
+		})
 		return nil, nil, err
 	}
+	elapsedMs := time.Since(startedAt).Milliseconds()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		h.codexAutoRefillLog("warn", "provider-response", fmt.Sprintf("refill provider responded with status %d for %s %s", resp.StatusCode, method, path), func(entry *codexAutoRefillLogEntry) {
+			entry.Method = method
+			entry.Path = path
+			entry.StatusCode = resp.StatusCode
+			entry.DurationMs = elapsedMs
+			entry.Error = strings.TrimSpace(string(responseBody))
+		})
 		return nil, resp.Header.Clone(), fmt.Errorf("refill request %s %s failed with status %d: %s", method, path, resp.StatusCode, strings.TrimSpace(string(responseBody)))
 	}
+	h.codexAutoRefillLog("info", "provider-response", fmt.Sprintf("refill provider responded with status %d for %s %s", resp.StatusCode, method, path), func(entry *codexAutoRefillLogEntry) {
+		entry.Method = method
+		entry.Path = path
+		entry.StatusCode = resp.StatusCode
+		entry.DurationMs = elapsedMs
+	})
 	return responseBody, resp.Header.Clone(), nil
 }
 
