@@ -538,7 +538,60 @@ func TestCodexAutoRefillProviderQuotaStatus_FetchesAndCachesSessionSnapshot(t *t
 	}
 }
 
-func TestCodexAutoRefillProviderQuotaStatus_UnsupportedInAPIKeyMode(t *testing.T) {
+func TestCodexAutoRefillProviderQuotaStatus_UsesSessionEvenWhenRefillModeIsAPIKey(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+
+	var meCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/me" {
+			http.NotFound(w, r)
+			return
+		}
+		meCalls.Add(1)
+		cookie, err := r.Cookie("token_atlas_session")
+		if err != nil {
+			t.Fatalf("expected session cookie: %v", err)
+		}
+		if cookie.Value != "session-token" {
+			t.Fatalf("session cookie = %q, want %q", cookie.Value, "session-token")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"quota":{"remaining":9}}`))
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{
+		QuotaExceeded: config.QuotaExceeded{
+			CodexAutoRefill: config.CodexAutoRefill{
+				ProviderURL:  server.URL,
+				AuthMode:     "api-key",
+				APIKey:       "api-key-token",
+				SessionValue: "session-token",
+			},
+		},
+	}
+	h := NewHandlerWithoutConfigFilePath(cfg, coreauth.NewManager(nil, nil, nil))
+
+	snapshot := h.codexAutoRefillProviderQuotaStatus(context.Background(), h.currentCodexAutoRefillRuntimeConfig(), time.Now())
+
+	if meCalls.Load() != 1 {
+		t.Fatalf("/me calls = %d, want 1", meCalls.Load())
+	}
+	if !snapshot.Supported {
+		t.Fatalf("supported = false, want true")
+	}
+	if snapshot.AuthMode != "session" {
+		t.Fatalf("authMode = %q, want session", snapshot.AuthMode)
+	}
+	if snapshot.Error != "" {
+		t.Fatalf("error = %q, want empty", snapshot.Error)
+	}
+	if snapshot.QuotaRemaining == nil || *snapshot.QuotaRemaining != 9 {
+		t.Fatalf("quotaRemaining = %#v, want 9", snapshot.QuotaRemaining)
+	}
+}
+
+func TestCodexAutoRefillProviderQuotaStatus_UnsupportedWithoutSession(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	t.Setenv("TOKEN_ATLAS_API_KEY", "secret-token")
 
@@ -565,8 +618,8 @@ func TestCodexAutoRefillProviderQuotaStatus_UnsupportedInAPIKeyMode(t *testing.T
 	if snapshot.Supported {
 		t.Fatalf("supported = true, want false")
 	}
-	if !strings.Contains(snapshot.Error, "session") {
-		t.Fatalf("error = %q, want session auth mode hint", snapshot.Error)
+	if !strings.Contains(snapshot.Error, "token_atlas_session") {
+		t.Fatalf("error = %q, want token_atlas_session hint", snapshot.Error)
 	}
 	if requestCount.Load() != 0 {
 		t.Fatalf("request count = %d, want 0", requestCount.Load())

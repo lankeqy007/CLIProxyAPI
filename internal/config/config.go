@@ -197,7 +197,8 @@ type CodexAutoRefill struct {
 	// ProviderURL points at the external claim/download service base URL.
 	ProviderURL string `yaml:"provider-url,omitempty" json:"provider-url,omitempty"`
 
-	// AuthMode selects how the external service is authenticated: "api-key" or "session".
+	// AuthMode selects how the actual refill claim/download flow is authenticated: "api-key" or "session".
+	// Provider status reads like GET /me may still use session separately when configured.
 	AuthMode string `yaml:"auth-mode,omitempty" json:"auth-mode,omitempty"`
 
 	// APIKey stores the external API key directly in config. When present, it takes precedence over env lookup.

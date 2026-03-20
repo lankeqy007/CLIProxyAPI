@@ -90,7 +90,7 @@ quota-exceeded:
   codex-auto-refill:
     enable: false # Enable automatic refill for file-backed Codex auths
     provider-url: "https://gptfreetoken.pony.indevs.in"
-    auth-mode: "api-key" # "api-key" (recommended) or "session"
+    auth-mode: "api-key" # Actual refill path: "api-key" or "session". Provider /me status prefers session separately when available.
     api-key: "" # Optional direct refill API key saved in config; takes precedence over env lookup
     api-key-env: "TOKEN_ATLAS_API_KEY" # Optional environment variable fallback for the refill API key
     session-value: "" # Optional direct token_atlas_session saved in config; takes precedence over env lookup

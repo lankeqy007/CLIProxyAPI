@@ -209,30 +209,15 @@ func (h *Handler) storeCodexAutoRefillProviderQuota(cacheKey string, snapshot co
 }
 
 func (h *Handler) fetchCodexAutoRefillProviderQuota(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, now time.Time) codexAutoRefillProviderQuotaSnapshot {
-	authMode := strings.TrimSpace(runtimeCfg.AuthMode)
-	if authMode == "" {
-		authMode = "api-key"
-	}
+	session, err := resolveCodexAutoRefillProviderQuotaSession(runtimeCfg)
 	snapshot := codexAutoRefillProviderQuotaSnapshot{
-		Supported: authMode == "session",
+		Supported: err == nil,
 		Endpoint:  "/me",
-		AuthMode:  authMode,
+		AuthMode:  "session",
 		FetchedAt: now.UTC(),
 	}
-	if authMode != "session" {
-		snapshot.Error = "GET /me currently requires session auth mode"
-		return snapshot
-	}
-
-	session, err := resolveCodexAutoRefillSecret(
-		runtimeCfg.SessionValue,
-		runtimeCfg.SessionEnv,
-		codexAutoRefillDefaultSessionEnv,
-		"codex auto-refill session",
-		"quota-exceeded.codex-auto-refill.session-value",
-	)
 	if err != nil {
-		snapshot.Error = err.Error()
+		snapshot.Error = "GET /me requires token_atlas_session; keep refill mode as api-key if you want, but configure session-value or session-env separately"
 		return snapshot
 	}
 
@@ -257,30 +242,26 @@ func (h *Handler) fetchCodexAutoRefillProviderQuota(ctx context.Context, runtime
 
 func codexAutoRefillProviderQuotaCacheKey(runtimeCfg codexAutoRefillRuntimeConfig) string {
 	baseURL := strings.TrimRight(strings.TrimSpace(runtimeCfg.ProviderURL), "/")
-	authMode := strings.TrimSpace(runtimeCfg.AuthMode)
-	if authMode == "" {
-		authMode = "api-key"
+	session, err := resolveCodexAutoRefillProviderQuotaSession(runtimeCfg)
+	if err != nil {
+		return baseURL + "|provider-me|missing"
 	}
-	if authMode != "session" {
-		return baseURL + "|" + authMode
-	}
+	return baseURL + "|provider-me|" + codexAutoRefillSecretHash(session)
+}
 
-	session, err := resolveCodexAutoRefillSecret(
+func codexAutoRefillSecretHash(value string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
+	return hex.EncodeToString(sum[:8])
+}
+
+func resolveCodexAutoRefillProviderQuotaSession(runtimeCfg codexAutoRefillRuntimeConfig) (string, error) {
+	return resolveCodexAutoRefillSecret(
 		runtimeCfg.SessionValue,
 		runtimeCfg.SessionEnv,
 		codexAutoRefillDefaultSessionEnv,
 		"codex auto-refill session",
 		"quota-exceeded.codex-auto-refill.session-value",
 	)
-	if err != nil {
-		return baseURL + "|" + authMode + "|missing"
-	}
-	return baseURL + "|" + authMode + "|" + codexAutoRefillSecretHash(session)
-}
-
-func codexAutoRefillSecretHash(value string) string {
-	sum := sha256.Sum256([]byte(strings.TrimSpace(value)))
-	return hex.EncodeToString(sum[:8])
 }
 
 func decodeCodexAutoRefillProviderQuota(raw []byte) (map[string]any, error) {
