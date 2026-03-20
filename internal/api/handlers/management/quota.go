@@ -41,7 +41,7 @@ func (h *Handler) PutCodexAutoRefill(c *gin.Context) {
 func (h *Handler) GetCodexAutoRefillStatus(c *gin.Context) {
 	now := time.Now()
 	runtimeCfg := h.currentCodexAutoRefillRuntimeConfig()
-	providerQuota := h.codexAutoRefillProviderQuotaStatus(c.Request.Context(), runtimeCfg, now)
+	providerQuota := h.codexAutoRefillProviderQuotaStatus(c.Request.Context(), runtimeCfg, now, false)
 	status := h.codexAutoRefillStatusSnapshot(runtimeCfg, h.codexAutoRefillPool(now), providerQuota, now)
 	c.JSON(http.StatusOK, gin.H{"status": status})
 }

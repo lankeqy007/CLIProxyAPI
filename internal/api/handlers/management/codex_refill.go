@@ -169,10 +169,12 @@ func (h *Handler) currentCodexAutoRefillRuntimeConfig() codexAutoRefillRuntimeCo
 	}
 }
 
-func (h *Handler) codexAutoRefillProviderQuotaStatus(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, now time.Time) codexAutoRefillProviderQuotaSnapshot {
+func (h *Handler) codexAutoRefillProviderQuotaStatus(ctx context.Context, runtimeCfg codexAutoRefillRuntimeConfig, now time.Time, forceRefresh bool) codexAutoRefillProviderQuotaSnapshot {
 	cacheKey := codexAutoRefillProviderQuotaCacheKey(runtimeCfg)
-	if snapshot, ok := h.cachedCodexAutoRefillProviderQuota(cacheKey, now); ok {
-		return snapshot
+	if !forceRefresh {
+		if snapshot, ok := h.cachedCodexAutoRefillProviderQuota(cacheKey, now); ok {
+			return snapshot
+		}
 	}
 
 	snapshot := h.fetchCodexAutoRefillProviderQuota(ctx, runtimeCfg, now)
@@ -262,6 +264,19 @@ func resolveCodexAutoRefillProviderQuotaSession(runtimeCfg codexAutoRefillRuntim
 		"codex auto-refill session",
 		"quota-exceeded.codex-auto-refill.session-value",
 	)
+}
+
+func codexAutoRefillProviderRemaining(snapshot codexAutoRefillProviderQuotaSnapshot) (int, bool) {
+	if snapshot.QuotaRemaining == nil {
+		return 0, false
+	}
+	if *snapshot.QuotaRemaining <= 0 {
+		return 0, true
+	}
+	if *snapshot.QuotaRemaining > int64(^uint(0)>>1) {
+		return int(^uint(0) >> 1), true
+	}
+	return int(*snapshot.QuotaRemaining), true
 }
 
 func decodeCodexAutoRefillProviderQuota(raw []byte) (map[string]any, error) {
@@ -538,6 +553,44 @@ func (h *Handler) runCodexAutoRefillWithTrigger(trigger string) {
 				entry.RequestedCount = missing
 			})
 			missing = hourlyRemaining
+		}
+	}
+	if providerQuota := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, now, true); providerQuota.Supported {
+		if strings.TrimSpace(providerQuota.Error) != "" {
+			skipReason := fmt.Sprintf("provider quota refresh failed: %s", strings.TrimSpace(providerQuota.Error))
+			h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+			h.codexAutoRefillLog("warn", "provider-quota", skipReason, func(entry *codexAutoRefillLogEntry) {
+				entry.Trigger = trigger
+				entry.ReadyCount = pool.ReadyCount
+				entry.CoolingCount = pool.CoolingCount
+				entry.UnavailableCount = pool.UnavailableCount
+				entry.DisabledCount = pool.DisabledCount
+				entry.TotalCount = pool.TotalCount
+				entry.Error = strings.TrimSpace(providerQuota.Error)
+			})
+			return
+		}
+		if providerRemaining, ok := codexAutoRefillProviderRemaining(providerQuota); ok {
+			if providerRemaining <= 0 {
+				skipReason := "provider quota exhausted (remaining=0)"
+				h.observeCodexAutoRefill(now, trigger, pool, skipReason)
+				h.codexAutoRefillLog("warn", "provider-quota", skipReason, func(entry *codexAutoRefillLogEntry) {
+					entry.Trigger = trigger
+					entry.ReadyCount = pool.ReadyCount
+					entry.CoolingCount = pool.CoolingCount
+					entry.UnavailableCount = pool.UnavailableCount
+					entry.DisabledCount = pool.DisabledCount
+					entry.TotalCount = pool.TotalCount
+				})
+				return
+			}
+			if missing > providerRemaining {
+				h.codexAutoRefillLog("info", "provider-quota", fmt.Sprintf("refill request capped by provider quota: requested=%d allowed=%d", missing, providerRemaining), func(entry *codexAutoRefillLogEntry) {
+					entry.Trigger = trigger
+					entry.RequestedCount = missing
+				})
+				missing = providerRemaining
+			}
 		}
 	}
 	if missing <= 0 {

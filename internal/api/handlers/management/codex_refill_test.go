@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -251,6 +252,9 @@ func TestRunCodexAutoRefill_UsesDirectSessionWithoutEnv(t *testing.T) {
 			t.Fatalf("session cookie = %q, want %q", cookie.Value, "session-token")
 		}
 		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/me":
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"quota":{"remaining":1,"limit":15,"used":0}}`))
 		case r.Method == http.MethodPost && r.URL.Path == "/me/claim":
 			claimCalls.Add(1)
 			w.Header().Set("Content-Type", "application/json")
@@ -496,9 +500,9 @@ func TestCodexAutoRefillProviderQuotaStatus_FetchesAndCachesSessionSnapshot(t *t
 	runtimeCfg := h.currentCodexAutoRefillRuntimeConfig()
 	startedAt := time.Now()
 
-	first := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, startedAt)
-	second := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, startedAt.Add(30*time.Second))
-	third := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, startedAt.Add(61*time.Second))
+	first := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, startedAt, false)
+	second := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, startedAt.Add(30*time.Second), false)
+	third := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, startedAt.Add(61*time.Second), false)
 
 	if meCalls.Load() != 2 {
 		t.Fatalf("/me calls = %d, want 2", meCalls.Load())
@@ -572,7 +576,7 @@ func TestCodexAutoRefillProviderQuotaStatus_UsesSessionEvenWhenRefillModeIsAPIKe
 	}
 	h := NewHandlerWithoutConfigFilePath(cfg, coreauth.NewManager(nil, nil, nil))
 
-	snapshot := h.codexAutoRefillProviderQuotaStatus(context.Background(), h.currentCodexAutoRefillRuntimeConfig(), time.Now())
+	snapshot := h.codexAutoRefillProviderQuotaStatus(context.Background(), h.currentCodexAutoRefillRuntimeConfig(), time.Now(), false)
 
 	if meCalls.Load() != 1 {
 		t.Fatalf("/me calls = %d, want 1", meCalls.Load())
@@ -613,7 +617,7 @@ func TestCodexAutoRefillProviderQuotaStatus_UnsupportedWithoutSession(t *testing
 	}
 	h := NewHandlerWithoutConfigFilePath(cfg, coreauth.NewManager(nil, nil, nil))
 
-	snapshot := h.codexAutoRefillProviderQuotaStatus(context.Background(), h.currentCodexAutoRefillRuntimeConfig(), time.Now())
+	snapshot := h.codexAutoRefillProviderQuotaStatus(context.Background(), h.currentCodexAutoRefillRuntimeConfig(), time.Now(), false)
 
 	if snapshot.Supported {
 		t.Fatalf("supported = true, want false")
@@ -623,6 +627,147 @@ func TestCodexAutoRefillProviderQuotaStatus_UnsupportedWithoutSession(t *testing
 	}
 	if requestCount.Load() != 0 {
 		t.Fatalf("request count = %d, want 0", requestCount.Load())
+	}
+}
+
+func TestRunCodexAutoRefill_ForceRefreshesProviderQuotaBeforeClaim(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	t.Setenv("TOKEN_ATLAS_API_KEY", "secret-token")
+
+	var meCalls atomic.Int32
+	var claimCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/me":
+			call := meCalls.Add(1)
+			cookie, err := r.Cookie("token_atlas_session")
+			if err != nil {
+				t.Fatalf("expected session cookie: %v", err)
+			}
+			if cookie.Value != "session-token" {
+				t.Fatalf("session cookie = %q, want %q", cookie.Value, "session-token")
+			}
+			remaining := 3
+			if call >= 2 {
+				remaining = 1
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"quota":{"remaining":%d,"limit":15,"used":0}}`, remaining)))
+		case r.Method == http.MethodPost && r.URL.Path == "/api/claim":
+			claimCalls.Add(1)
+			body, _ := io.ReadAll(r.Body)
+			var payload map[string]int
+			if err := json.Unmarshal(body, &payload); err != nil {
+				t.Fatalf("claim body decode error: %v", err)
+			}
+			if payload["count"] != 1 {
+				t.Fatalf("claim count = %d, want 1", payload["count"])
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"claims":[{"token_id":"501"}]}`))
+		case r.Method == http.MethodGet && r.URL.Path == "/api/download/501":
+			w.Header().Set("Content-Disposition", `attachment; filename="fresh.json"`)
+			_, _ = w.Write([]byte(`{"type":"codex","email":"fresh@example.com","account_id":"acc-fresh","refresh_token":"r1"}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	authDir := t.TempDir()
+	cfg := &config.Config{
+		AuthDir: authDir,
+		QuotaExceeded: config.QuotaExceeded{
+			CodexAutoRefill: config.CodexAutoRefill{
+				Enable:                  true,
+				ProviderURL:             server.URL,
+				AuthMode:                "api-key",
+				APIKeyEnv:               "TOKEN_ATLAS_API_KEY",
+				SessionValue:            "session-token",
+				CheckIntervalSeconds:    1,
+				MinClaimIntervalSeconds: 1,
+				TimeoutSeconds:          5,
+				LowWatermark:            1,
+				TargetReady:             5,
+				MaxClaimPerRun:          5,
+				RequireConsecutiveLow:   1,
+				VerifyAfterImport:       false,
+			},
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+	runtimeCfg := h.currentCodexAutoRefillRuntimeConfig()
+
+	cached := h.codexAutoRefillProviderQuotaStatus(context.Background(), runtimeCfg, time.Now(), false)
+	if cached.QuotaRemaining == nil || *cached.QuotaRemaining != 3 {
+		t.Fatalf("cached quotaRemaining = %#v, want 3", cached.QuotaRemaining)
+	}
+
+	h.runCodexAutoRefill()
+
+	if meCalls.Load() != 2 {
+		t.Fatalf("/me calls = %d, want 2", meCalls.Load())
+	}
+	if claimCalls.Load() != 1 {
+		t.Fatalf("claim calls = %d, want 1", claimCalls.Load())
+	}
+	if len(manager.List()) != 1 {
+		t.Fatalf("imported auth count = %d, want 1", len(manager.List()))
+	}
+}
+
+func TestRunCodexAutoRefill_SkipsWhenProviderQuotaRefreshFails(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	t.Setenv("TOKEN_ATLAS_API_KEY", "secret-token")
+
+	var claimCalls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/me":
+			http.Error(w, "provider unavailable", http.StatusBadGateway)
+		case r.Method == http.MethodPost && r.URL.Path == "/api/claim":
+			claimCalls.Add(1)
+			http.NotFound(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	authDir := t.TempDir()
+	cfg := &config.Config{
+		AuthDir: authDir,
+		QuotaExceeded: config.QuotaExceeded{
+			CodexAutoRefill: config.CodexAutoRefill{
+				Enable:                  true,
+				ProviderURL:             server.URL,
+				AuthMode:                "api-key",
+				APIKeyEnv:               "TOKEN_ATLAS_API_KEY",
+				SessionValue:            "session-token",
+				CheckIntervalSeconds:    1,
+				MinClaimIntervalSeconds: 1,
+				TimeoutSeconds:          5,
+				LowWatermark:            1,
+				TargetReady:             2,
+				MaxClaimPerRun:          2,
+				RequireConsecutiveLow:   1,
+				VerifyAfterImport:       false,
+			},
+		},
+	}
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(cfg, manager)
+
+	h.runCodexAutoRefill()
+
+	if claimCalls.Load() != 0 {
+		t.Fatalf("claim calls = %d, want 0", claimCalls.Load())
+	}
+	status := h.codexAutoRefillStatusSnapshot(h.currentCodexAutoRefillRuntimeConfig(), h.codexAutoRefillPool(time.Now()), codexAutoRefillProviderQuotaSnapshot{}, time.Now())
+	if !strings.Contains(status.LastSkipReason, "provider quota refresh failed") {
+		t.Fatalf("lastSkipReason = %q, want provider quota refresh failed", status.LastSkipReason)
 	}
 }
 
